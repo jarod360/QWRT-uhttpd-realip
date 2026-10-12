@@ -2,13 +2,6 @@ name: Build uhttpd with trusted X-Real-IP
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - realip-dev
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: read
