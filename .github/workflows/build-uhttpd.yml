@@ -40,7 +40,7 @@ jobs:
           s = p.read_text()
           s = s.replace('PKG_SOURCE_DATE:=2026-08-24', 'PKG_SOURCE_DATE:=2026-08-03')
           s = s.replace('PKG_SOURCE_VERSION:=373145f72c884c36a2b16f7f47e74ffae06bd754', 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22')
-          s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
+          s = '\\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\\n'
           if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
               raise SystemExit('Could not pin expected uhttpd source revision')
           p.write_text(s)
@@ -75,6 +75,12 @@ jobs:
           mkdir -p ../realip
           make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
 
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j2 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+
       - name: Patch and build uhttpd
         working-directory: openwrt
         run: |
@@ -100,7 +106,7 @@ jobs:
             ar t "$f"
             ar p "$f" control.tar.gz | tar -xzO ./control || true
           done
-          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \;
+          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \\;
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -111,5 +117,6 @@ jobs:
             realip/artifacts/build.log
             realip/artifacts/prepare-build.log
             realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
           if-no-files-found: warn
           retention-days: 30
