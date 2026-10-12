@@ -37,7 +37,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p = Path('package/network/services/uhttpd/Makefile')
-          s = p.read_text()
+          s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
           s = s.replace('PKG_SOURCE_DATE:=2026-08-24', 'PKG_SOURCE_DATE:=2026-08-03')
           s = s.replace('PKG_SOURCE_VERSION:=373145f72c884c36a2b16f7f47e74ffae06bd754', 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22')
           s = '\\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\\n'
@@ -106,7 +106,7 @@ jobs:
             ar t "$f"
             ar p "$f" control.tar.gz | tar -xzO ./control || true
           done
-          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \\;
+          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \;
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
