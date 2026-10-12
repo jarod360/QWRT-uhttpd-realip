@@ -29,3 +29,6 @@ uci commit uhttpd
 - CI 目标：qualcommax/ipq807x，软件包架构为 ARM64 Cortex-A53
 
 QWRT 使用定制 QSDK 内核和软件包仓库。CI 产物用于验证源码与架构；安装前必须核对设备上的依赖 ABI 和包管理器依赖，不能仅凭 CPU 架构相同就认定完全兼容。
+
+
+CI 修复：调整了对上游 uhttpd 命令行帮助文本的匹配方式。
