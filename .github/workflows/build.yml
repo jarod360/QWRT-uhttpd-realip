@@ -90,7 +90,8 @@ jobs:
           SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
           test -n "$SOURCE_DIR"
           python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
-          # Re-run the package target; Ninja detects the modified C sources.
+          # Force the package recipe to run again; Ninja then rebuilds changed C files.
+          rm -f "$SOURCE_DIR/.built"
           set -o pipefail
           make package/network/services/uhttpd/compile V=s -j2 2>&1 | tee ../realip/artifacts/build.log
 
