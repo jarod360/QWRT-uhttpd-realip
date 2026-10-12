@@ -1,0 +1,167 @@
+--- a/uhttpd.h
++++ b/uhttpd.h
+@@ -92,6 +92,7 @@ struct config {
+ 	struct list_head lua_prefix;
+ #ifdef HAVE_UCODE
+ 	struct list_head ucode_prefix;
+ #endif
+ 	struct list_head sni_redirect;
++	struct list_head real_ip_trusted;
+ };
+ 
+ struct sni_redirect {
+@@ -100,6 +101,11 @@ struct sni_redirect {
+ 	const char *url;
+ };
+ 
++struct real_ip_trusted {
++	struct list_head list;
++	struct uh_addr addr;
++};
++
+@@ -310,7 +316,7 @@ struct client {
+ 	int http_code;
+ 	struct http_request request;
+-	struct uh_addr srv_addr, peer_addr;
++	struct uh_addr srv_addr, peer_addr, remote_addr;
+ 
+ 	struct blob_buf hdr;
+ 	struct blob_buf hdr_response;
+--- a/main.c
++++ b/main.c
+@@ -26,6 +26,7 @@
+ #define _XOPEN_SOURCE	700
+ #include <sys/types.h>
+ #include <sys/socket.h>
++#include <arpa/inet.h>
+ #include <netinet/in.h>
+@@ -151,6 +152,7 @@ static int usage(const char *name)
+ 		"\t-R              Enable RFC1918 filter\n"
++		"\t-z address      Trust this reverse proxy for X-Real-IP (repeatable)\n"
+@@ -200,6 +202,7 @@ static void init_defaults_pre(void)
+ #endif
+ 	INIT_LIST_HEAD(&conf.sni_redirect);
++	INIT_LIST_HEAD(&conf.real_ip_trusted);
+ }
+ 
++static void add_real_ip_trusted(const char *value)
++{
++	struct real_ip_trusted *entry;
++
++	entry = calloc(1, sizeof(*entry));
++	if (!entry) {
++		perror("calloc");
++		exit(1);
++	}
++
++	if (inet_pton(AF_INET, value, &entry->addr.in) == 1)
++		entry->addr.family = AF_INET;
++	else if (inet_pton(AF_INET6, value, &entry->addr.in6) == 1)
++		entry->addr.family = AF_INET6;
++	else {
++		fprintf(stderr, "uhttpd: invalid trusted proxy address: %s\n", value);
++		free(entry);
++		exit(1);
++	}
++
++	list_add_tail(&entry->list, &conf.real_ip_trusted);
++}
++
+@@ -297,7 +321,7 @@ int main(int argc, char **argv)
+-	while ((ch = getopt(argc, argv, "A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qQ:Rr:Ss:T:t:U:u:Xx:y:")) != -1) {
++	while ((ch = getopt(argc, argv, "A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qQ:Rr:Ss:T:t:U:u:Xx:y:z:")) != -1) {
+@@ -388,6 +412,10 @@ int main(int argc, char **argv)
+ 		case 'R':
+ 			conf.rfc1918_filter = 1;
+ 			break;
++
++		case 'z':
++			add_real_ip_trusted(optarg);
++			break;
+ 
+ 		case 'n':
+--- a/client.c
++++ b/client.c
+@@ -18,6 +18,7 @@
+  */
+ 
++#include <arpa/inet.h>
+ #include <libubox/blobmsg.h>
+ #include <errno.h>
+ #include <limits.h>
+@@ -239,6 +240,55 @@ static bool request_header_check(struct client *cl)
+ 	return true;
+ }
+ 
++/*
++ * X-Real-IP is accepted only when the TCP peer is explicitly trusted.
++ * remote_addr is immutable for the lifetime of the connection; peer_addr
++ * is reset from it for every request to prevent keep-alive state leakage.
++ */
++static void client_update_real_ip(struct client *cl)
++{
++	struct real_ip_trusted *trusted;
++	struct blob_attr *cur;
++	struct uh_addr candidate = {};
++	const char *value = NULL;
++	int matches = 0, rem;
++	bool allowed = false;
++
++	cl->peer_addr = cl->remote_addr;
++
++	list_for_each_entry(trusted, &conf.real_ip_trusted, list) {
++		if (trusted->addr.family != cl->remote_addr.family)
++			continue;
++
++		if (trusted->addr.family == AF_INET &&
++		    trusted->addr.in.s_addr == cl->remote_addr.in.s_addr)
++			allowed = true;
++		else if (trusted->addr.family == AF_INET6 &&
++		         !memcmp(&trusted->addr.in6, &cl->remote_addr.in6,
++		                 sizeof(struct in6_addr)))
++			allowed = true;
++
++		if (allowed)
++			break;
++	}
++
++	if (!allowed)
++		return;
++
++	blob_for_each_attr(cur, cl->hdr.head, rem) {
++		if (strcmp(blobmsg_name(cur), "x-real-ip"))
++			continue;
++		matches++;
++		value = blobmsg_get_string(cur);
++	}
++
++	/* Ambiguous/multiple values and comma-separated proxy chains are rejected. */
++	if (matches != 1 || !value || strchr(value, ','))
++		return;
++
++	if (inet_pton(AF_INET, value, &candidate.in) == 1)
++		candidate.family = AF_INET;
++	else if (inet_pton(AF_INET6, value, &candidate.in6) == 1)
++		candidate.family = AF_INET6;
++	else
++		return;
++
++	cl->peer_addr.family = candidate.family;
++	if (candidate.family == AF_INET)
++		cl->peer_addr.in = candidate.in;
++	else
++		cl->peer_addr.in6 = candidate.in6;
++}
++
+ static bool rfc1918_filter_check(struct client *cl)
+@@ -302,6 +352,8 @@ static void client_header_complete(struct client *cl)
+ 	if (!request_header_check(cl))
+ 		return;
+ 
++	client_update_real_ip(cl);
++
+ 	if (!rfc1918_filter_check(cl))
+@@ -1012,6 +1064,7 @@ bool uh_accept_client(int fd, bool tls)
+ 	set_addr(&cl->peer_addr, &addr);
++	cl->remote_addr = cl->peer_addr;
+ 	sl = sizeof(addr);
