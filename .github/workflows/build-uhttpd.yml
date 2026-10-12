@@ -60,9 +60,15 @@ jobs:
           CONFIG_PACKAGE_uhttpd-mod-ubus=y
           CONFIG_PACKAGE_uhttpd-mod-ucode=y
           EOF
-          echo '===== package selections ====='
+          # Re-run defconfig now that package Kconfig symbols have been generated.
+          # This makes the selections visible to OpenWrt's package build rules.
+          make defconfig
+          echo '===== package selections after defconfig ====='
           grep -E '^CONFIG_PACKAGE_uhttpd(=|[-_])' .config
           grep -q '^CONFIG_PACKAGE_uhttpd=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-lua=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ubus=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ucode=y' .config
 
       - name: Download sources
         working-directory: openwrt
