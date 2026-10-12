@@ -77,6 +77,7 @@ jobs:
       - name: Build OpenWrt host tools
         working-directory: openwrt
         run: |
+          set -o pipefail
           make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
 
       - name: Apply real-IP changes and build packages
