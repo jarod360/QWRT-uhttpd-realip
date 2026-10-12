@@ -50,14 +50,241 @@ jobs:
           print('\n'.join(line for line in s.splitlines() if line.startswith(('PKG_SOURCE_DATE:=', 'PKG_SOURCE_VERSION:='))))
           PY
 
-      - name: Configure target and select uhttpd packages
+      - name: Configure aarch64_cortex-a53 package target and select uhttpd
         working-directory: openwrt
         run: |
+          # ImmortalWrt qualcommax/ipq807x is used only as the official
+          # Cortex-A53 toolchain/package-ABI reference. The required package
+          # architecture must match QWRT: aarch64_cortex-a53.
           cat > .config <<'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq807x=y
           EOF
           make defconfig
+          echo '===== resolved target architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"
+          CONFIG_PACKAGE_uhttpd=y
+          CONFIG_PACKAGE_uhttpd-mod-lua=y
+          CONFIG_PACKAGE_liblua=y
+          CONFIG_PACKAGE_uhttpd-mod-ubus=y
+          CONFIG_PACKAGE_uhttpd-mod-ucode=y
+          EOF
+          echo '===== package selections after defconfig ====='
+          grep -E '^CONFIG_PACKAGE_uhttpd(=|[-_])' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-lua=y' .config
+          grep -q '^CONFIG_PACKAGE_liblua=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ubus=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ucode=y' .config
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain and verify libgcc
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+          echo '===== toolchain configuration ====='
+          grep -E '^(CONFIG_TARGET_|CONFIG_ARCH_|CONFIG_USE_MUSL|CONFIG_GCC_VERSION|CONFIG_LIBC|CONFIG_TOOLCHAINOPTS)' .config || true
+          echo '===== build/install toolchain (serial for diagnostic clarity) ====='
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          echo '===== locate generated libgcc_s ====='
+          find staging_dir -path '*/libgcc_s.so*' -ls || true
+          TOOLCHAIN_LIB="$(find staging_dir -maxdepth 2 -type d -name 'toolchain-*' -print -quit)/lib"
+          echo "TOOLCHAIN_LIB=$TOOLCHAIN_LIB"
+          ls -lah "$TOOLCHAIN_LIB" || true
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install completed without producing libgcc_s.so*'
+            echo '===== toolchain lib directories ====='
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Build Lua runtime dependency
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make package/utils/lua/compile V=s -j1 2>&1 | tee ../realip/artifacts-lua.log
+
+      - name: Patch and build uhttpd
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/prepare-build.log
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+          python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
+          rm -f "$SOURCE_DIR/.built"
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+      - name: Verify packages
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          test -n "$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          mkdir -p ../realip/artifacts
+          find bin/packages -type f -name 'uhttpd*.ipk' -exec cp -t ../realip/artifacts/ {} +
+          for f in ../realip/artifacts/*.ipk; do
+            echo "===== $f ====="
+            file "$f"
+            ls -lh "$f"
+            ar t "$f"
+            echo "----- package control -----"
+            ar p "$f" control.tar.gz | tar -xzOf - ./control || true
+          done
+          echo '===== verify device package architecture and ABI dependency names ====='
+          CONTROL="$(ar p ../realip/artifacts/uhttpd_*.ipk control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53
+          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \;
+
+      - name: Upload build diagnostics and packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-build-output
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-lua.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+          if-no-files-found: warn
+          retention-days: 30
+ .config
+          make -s info | grep -E 'Target-Arch-Packages:|CPU-Type:'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          CONFIG_PACKAGE_uhttpd-mod-lua=y
+          CONFIG_PACKAGE_liblua=y
+          CONFIG_PACKAGE_uhttpd-mod-ubus=y
+          CONFIG_PACKAGE_uhttpd-mod-ucode=y
+          EOF
+          echo '===== package selections after defconfig ====='
+          grep -E '^CONFIG_PACKAGE_uhttpd(=|[-_])' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-lua=y' .config
+          grep -q '^CONFIG_PACKAGE_liblua=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ubus=y' .config
+          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ucode=y' .config
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain and verify libgcc
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+          echo '===== toolchain configuration ====='
+          grep -E '^(CONFIG_TARGET_|CONFIG_ARCH_|CONFIG_USE_MUSL|CONFIG_GCC_VERSION|CONFIG_LIBC|CONFIG_TOOLCHAINOPTS)' .config || true
+          echo '===== build/install toolchain (serial for diagnostic clarity) ====='
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          echo '===== locate generated libgcc_s ====='
+          find staging_dir -path '*/libgcc_s.so*' -ls || true
+          TOOLCHAIN_LIB="$(find staging_dir -maxdepth 2 -type d -name 'toolchain-*' -print -quit)/lib"
+          echo "TOOLCHAIN_LIB=$TOOLCHAIN_LIB"
+          ls -lah "$TOOLCHAIN_LIB" || true
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install completed without producing libgcc_s.so*'
+            echo '===== toolchain lib directories ====='
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Build Lua runtime dependency
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make package/utils/lua/compile V=s -j1 2>&1 | tee ../realip/artifacts-lua.log
+
+      - name: Patch and build uhttpd
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/prepare-build.log
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+          python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
+          rm -f "$SOURCE_DIR/.built"
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+      - name: Verify packages
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          test -n "$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          mkdir -p ../realip/artifacts
+          find bin/packages -type f -name 'uhttpd*.ipk' -exec cp -t ../realip/artifacts/ {} +
+          for f in ../realip/artifacts/*.ipk; do
+            echo "===== $f ====="
+            file "$f"
+            ls -lh "$f"
+            ar t "$f"
+            echo "----- package control -----"
+            ar p "$f" control.tar.gz | tar -xzOf - ./control || true
+          done
+          echo '===== verify device ABI dependency names ====='
+          ar p ../realip/artifacts/uhttpd_*.ipk control.tar.gz | tar -xzOf - ./control | grep -E '^(Package|Architecture|Depends):'
+          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \;
+
+      - name: Upload build diagnostics and packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-build-output
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-lua.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+          if-no-files-found: warn
+          retention-days: 30
+
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \;
+
+      - name: Upload build diagnostics and packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-build-output
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-lua.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+          if-no-files-found: warn
+          retention-days: 30
+ .config
+          make -s info | grep -E 'Target-Arch-Packages:|CPU-Type:'
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_uhttpd=y
           CONFIG_PACKAGE_uhttpd-mod-lua=y
