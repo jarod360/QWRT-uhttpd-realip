@@ -59,6 +59,7 @@ jobs:
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_uhttpd=y
           CONFIG_PACKAGE_uhttpd-mod-lua=y
+          CONFIG_PACKAGE_liblua=y
           CONFIG_PACKAGE_uhttpd-mod-ubus=y
           CONFIG_PACKAGE_uhttpd-mod-ucode=y
           EOF
@@ -66,6 +67,7 @@ jobs:
           grep -E '^CONFIG_PACKAGE_uhttpd(=|[-_])' .config
           grep -q '^CONFIG_PACKAGE_uhttpd=y' .config
           grep -q '^CONFIG_PACKAGE_uhttpd-mod-lua=y' .config
+          grep -q '^CONFIG_PACKAGE_liblua=y' .config
           grep -q '^CONFIG_PACKAGE_uhttpd-mod-ubus=y' .config
           grep -q '^CONFIG_PACKAGE_uhttpd-mod-ucode=y' .config
 
@@ -101,6 +103,12 @@ jobs:
             exit 1
           fi
 
+      - name: Build Lua runtime dependency
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make package/utils/lua/compile V=s -j1 2>&1 | tee ../realip/artifacts-lua.log
+
       - name: Patch and build uhttpd
         working-directory: openwrt
         run: |
@@ -117,14 +125,15 @@ jobs:
         working-directory: openwrt
         run: |
           set -eu
-          find bin/packages -type f -name 'uhttpd*.ipk' -print
-          test -n "$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          find bin/packages -type f -name 'uhttpd*.apk' -print
+          test -n "$(find bin/packages -type f -name 'uhttpd-*.apk' -print -quit)"
           mkdir -p ../realip/artifacts
-          cp bin/packages/*/base/uhttpd*.ipk ../realip/artifacts/
-          for f in ../realip/artifacts/*.ipk; do
+          cp bin/packages/*/base/uhttpd*.apk ../realip/artifacts/
+          for f in ../realip/artifacts/*.apk; do
             echo "===== $f ====="
-            ar t "$f"
-            ar p "$f" control.tar.gz | tar -xzO ./control || true
+            file "$f"
+            ls -lh "$f"
+            tar -tzf "$f" | head -40 || true
           done
           find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} \;
 
@@ -135,7 +144,9 @@ jobs:
           name: uhttpd-realip-build-output
           path: |
             realip/artifacts/*.ipk
+            realip/artifacts/*.apk
             realip/artifacts/*.log
+            realip/artifacts-lua.log
             realip/artifacts-host-tools.log
             realip/artifacts-toolchain.log
           if-no-files-found: warn
