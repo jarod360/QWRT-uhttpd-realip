@@ -84,7 +84,7 @@ jobs:
         working-directory: openwrt
         run: |
           mkdir -p ../realip/artifacts
-          make package/network/services/uhttpd/prepare V=s
+          make package/network/services/uhttpd/.prepare V=s
           SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
           test -n "$SOURCE_DIR"
           python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
