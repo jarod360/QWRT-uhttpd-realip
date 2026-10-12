@@ -58,7 +58,7 @@ jobs:
           echo '===== resolved package architecture ====='
           grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
           grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
-          make -s info | grep -E 'Target-Arch-Packages:|CPU-Type:'
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_uhttpd=y
           CONFIG_PACKAGE_uhttpd-mod-lua=y
