@@ -31,9 +31,8 @@ replace_once("uhttpd.h", "\tstruct dispatch dispatch;\n};",
 
 replace_once("main.c", "#include <sys/socket.h>\n#include <netinet/in.h>",
     "#include <sys/socket.h>\n#include <arpa/inet.h>\n#include <netinet/in.h>")
-replace_once("main.c", '\t\t"\\t-R              Enable RFC1918 filter\\n"\n',
-    '\t\t"\\t-R              Enable RFC1918 filter\\n"\n'
-    '\t\t"\\t-z address      Trust this reverse proxy for X-Real-IP (repeatable)\\n"\n')
+replace_once("main.c", "Enable RFC1918 filter\\\\n",
+    "Enable RFC1918 filter\\\\n\\\\t-z address      Trust this reverse proxy for X-Real-IP (repeatable)\\\\n")
 replace_once("main.c", "\tINIT_LIST_HEAD(&conf.sni_redirect);\n}",
     "\tINIT_LIST_HEAD(&conf.sni_redirect);\n\tINIT_LIST_HEAD(&conf.real_ip_trusted);\n}")
 replace_once("main.c", "static void init_defaults_post(void)\n{",
