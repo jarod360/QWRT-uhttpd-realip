@@ -50,8 +50,8 @@ jobs:
               "PKG_SOURCE_VERSION:=373145f72c884c36a2b16f7f47e74ffae06bd754",
               "PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22",
           )
-          s = "\n".join(line for line in s.splitlines()
-                        if not line.startswith("PKG_MIRROR_HASH:=")) + "\n"
+          s = "\\n".join(line for line in s.splitlines()
+                        if not line.startswith("PKG_MIRROR_HASH:=")) + "\\n"
           if "PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22" not in s:
               raise SystemExit("Could not pin the expected uhttpd source revision")
           p.write_text(s)
@@ -73,6 +73,11 @@ jobs:
       - name: Download sources
         working-directory: openwrt
         run: make download -j4
+
+      - name: Build OpenWrt host tools
+        working-directory: openwrt
+        run: |
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
 
       - name: Apply real-IP changes and build packages
         working-directory: openwrt
@@ -101,7 +106,7 @@ jobs:
           find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c '
             file "$1"
             readelf -d "$1" | grep NEEDED || true
-          ' sh {} \;
+          ' sh {} \\;
 
       - name: Upload IPK packages and build artifacts
         uses: actions/upload-artifact@v4
@@ -110,5 +115,6 @@ jobs:
           path: |
             realip/artifacts/*.ipk
             realip/artifacts/build.log
+            realip/artifacts-host-tools.log
           if-no-files-found: warn
           retention-days: 30
