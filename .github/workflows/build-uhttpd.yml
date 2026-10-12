@@ -36,10 +36,13 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
+
           p = Path('package/network/services/uhttpd/Makefile')
           s = p.read_text()
-          import re
-          s = re.sub(r'^PKG_SOURCE_DATE:=.*
+          s = re.sub(r'^PKG_SOURCE_DATE:=.*$', 'PKG_SOURCE_DATE:=2026-08-03', s, flags=re.M)
+          s = re.sub(r'^PKG_SOURCE_VERSION:=.*$', 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22', s, flags=re.M)
+          s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
           if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
               raise SystemExit('Could not pin expected uhttpd source revision')
           p.write_text(s)
