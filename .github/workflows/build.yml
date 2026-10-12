@@ -181,3 +181,114 @@ jobs:
             realip/artifacts-host-tools.log
           if-no-files-found: warn
           retention-days: 30
+ .config
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build OpenWrt host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Apply real-IP changes and build packages
+        working-directory: openwrt
+        run: |
+          mkdir -p ../realip/artifacts
+          # First run the package target once so OpenWrt performs its own
+          # download/unpack/prepare steps and creates PKG_BUILD_DIR.
+          make package/network/services/uhttpd/compile V=s -j2 2>&1 | tee ../realip/artifacts/prepare-build.log
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+          python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
+          # Force the package recipe to run again; Ninja then rebuilds changed C files.
+          rm -f "$SOURCE_DIR/.built"
+          set -o pipefail
+          make package/network/services/uhttpd/compile V=s -j2 2>&1 | tee ../realip/artifacts/build.log
+
+      - name: Verify package architecture and ELF dependencies
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          test -n "$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          mkdir -p ../realip/artifacts
+          cp bin/packages/*/base/uhttpd*.ipk ../realip/artifacts/
+          for f in ../realip/artifacts/*.ipk; do
+            echo "===== $f ====="
+            ar t "$f"
+            ar p "$f" control.tar.gz | tar -xzO ./control || true
+          done
+          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c '
+            file "$1"
+            readelf -d "$1" | grep NEEDED || true
+          ' sh {} \\;
+
+      - name: Upload IPK packages and build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-ipk
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/build.log
+            realip/artifacts/prepare-build.log
+            realip/artifacts-host-tools.log
+          if-no-files-found: warn
+          retention-days: 30
+ .config
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build OpenWrt host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Apply real-IP changes and build packages
+        working-directory: openwrt
+        run: |
+          mkdir -p ../realip/artifacts
+          # First run the package target once so OpenWrt performs its own
+          # download/unpack/prepare steps and creates PKG_BUILD_DIR.
+          make package/network/services/uhttpd/compile V=s -j2 2>&1 | tee ../realip/artifacts/prepare-build.log
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+          python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
+          # Force the package recipe to run again; Ninja then rebuilds changed C files.
+          rm -f "$SOURCE_DIR/.built"
+          set -o pipefail
+          make package/network/services/uhttpd/compile V=s -j2 2>&1 | tee ../realip/artifacts/build.log
+
+      - name: Verify package architecture and ELF dependencies
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          test -n "$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          mkdir -p ../realip/artifacts
+          cp bin/packages/*/base/uhttpd*.ipk ../realip/artifacts/
+          for f in ../realip/artifacts/*.ipk; do
+            echo "===== $f ====="
+            ar t "$f"
+            ar p "$f" control.tar.gz | tar -xzO ./control || true
+          done
+          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c '
+            file "$1"
+            readelf -d "$1" | grep NEEDED || true
+          ' sh {} \\;
+
+      - name: Upload IPK packages and build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-ipk
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/build.log
+            realip/artifacts/prepare-build.log
+            realip/artifacts-host-tools.log
+          if-no-files-found: warn
+          retention-days: 30
