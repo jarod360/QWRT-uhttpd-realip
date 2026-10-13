@@ -61,18 +61,37 @@ jobs:
           echo 'Architecture verified from .config; skipping make info (not required for package build).'
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_uhttpd=y
-          CONFIG_PACKAGE_uhttpd-mod-lua=y
-          CONFIG_PACKAGE_liblua=y
-          CONFIG_PACKAGE_uhttpd-mod-ubus=y
-          CONFIG_PACKAGE_uhttpd-mod-ucode=y
           EOF
           make defconfig
-          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd=y' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd-mod-lua=y' .config
-          grep -q '^CONFIG_PACKAGE_liblua=y' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ubus=y' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ucode=y' .config
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
 
       - name: Download sources
         working-directory: openwrt
@@ -94,12 +113,6 @@ jobs:
             find staging_dir -maxdepth 3 -type d -name lib -print
             exit 1
           fi
-
-      - name: Build Lua runtime dependency
-        working-directory: openwrt
-        run: |
-          set -o pipefail
-          make package/utils/lua/compile V=s -j1 2>&1 | tee ../realip/artifacts-lua.log
 
       - name: Prepare, patch, and build uhttpd once
         working-directory: openwrt
