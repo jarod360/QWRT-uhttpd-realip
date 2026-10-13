@@ -213,19 +213,3 @@ jobs:
             realip/artifacts-lua.log
           if-no-files-found: warn
           retention-days: 30
-
-          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
-          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
-          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
-          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
-
-          echo '===== verify patched uhttpd binary ====='
-          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
-          file ../realip/artifacts/uhttpd
-          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
-          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
-          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
-          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
-          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
-
-          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} ;
