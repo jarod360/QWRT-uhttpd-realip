@@ -1,16 +1,20 @@
 # QWRT uhttpd Real IP
 
-为 uhttpd 增加可信反向代理的 X-Real-IP 支持，供 CGI、Lua/LuCI 通过 REMOTE_ADDR 读取客户端真实地址。
+为 uhttpd 增加可信反向代理真实 IP 支持，兼容 `X-Real-IP` 和 `X-Forwarded-For`，供 CGI、Lua/LuCI 通过 `REMOTE_ADDR` 读取客户端地址。
 
 ## 安全模型
 
-- 仅接受配置在 set_real_ip_from 中的 TCP 来源地址。
-- 仅解析单个、格式严格合法的 IPv4 或 IPv6 X-Real-IP。
-- 未配置可信代理、请求头缺失、重复或格式非法时，继续使用 TCP 原始对端地址。
-- 每个 Keep-Alive 请求都从不可变的 TCP 原始地址重新计算，不继承上一个请求的真实地址。
-- 默认请求头固定为 X-Real-IP，不支持从任意客户端传入的代理链。
+- 只有 TCP 直接连接来源命中 `set_real_ip_from` 配置的代理，才会读取转发请求头。
+- 优先使用唯一且格式合法的 `X-Real-IP`；缺失、重复或非法时，尝试 `X-Forwarded-For`。
+- `X-Forwarded-For` 按代理链从右向左解析，跳过可信代理地址，取第一个非可信地址；不简单取最左侧，降低客户端伪造链前缀的风险。
+- 目前 `set_real_ip_from` 接受单个 IPv4/IPv6 地址，可重复配置；暂不支持 CIDR 网段。
+- `X-Forwarded-For` 目前要求只有一个字段值，字段内容可以是逗号分隔的 IP 链；重复字段、空项或非法 IP 会回退到 TCP 对端地址。
+- 原始 TCP 对端地址始终单独保存；每个 Keep-Alive 请求都从原始地址重新计算，不继承上一个请求的真实 IP。
+- 两个请求头都不可用、或直接连接来源不可信时，继续使用 TCP 原始对端地址。
 
 ## QWRT 配置示例
+
+雷池直接连接 OpenWrt，且雷池地址为 `192.168.0.251` 时：
 
 ```sh
 uci add_list uhttpd.main.set_real_ip_from='192.168.0.251'
@@ -18,17 +22,14 @@ uci commit uhttpd
 /etc/init.d/uhttpd restart
 ```
 
-如果存在多个可信代理，可重复添加 set_real_ip_from。
+如果请求链路中存在多个受控代理，只有实际可能作为 TCP 连接来源或出现在 `X-Forwarded-For` 链中的代理地址才需要加入可信列表。每个地址重复添加一项。
 
-**重要：** 只能把实际受控的反向代理/WAF 地址加入可信列表。不要把 0.0.0.0/0、整个 LAN 或不受信任的客户端地址加入。
+**重要：** 只添加实际受控的反向代理/WAF 地址。不要添加 `0.0.0.0/0`、整个 LAN 或不受信任的客户端地址。
 
 ## 源码基线
 
-- uhttpd: 60f64bec40c8113cf09815ec377761b1f4f95f22
-- OpenWrt build system: openwrt-25.12
-- CI 目标：qualcommax/ipq807x，软件包架构为 ARM64 Cortex-A53
+- uhttpd: `60f64bec40c8113cf09815ec377761b1f4f95f22`
+- OpenWrt build system: ImmortalWrt `v24.10.6`
+- CI 工具链映射：`qualcommax/ipq807x`，软件包架构 `aarch64_cortex-a53`
 
 QWRT 使用定制 QSDK 内核和软件包仓库。CI 产物用于验证源码与架构；安装前必须核对设备上的依赖 ABI 和包管理器依赖，不能仅凭 CPU 架构相同就认定完全兼容。
-
-
-CI 修复：调整了对上游 uhttpd 命令行帮助文本的匹配方式。
