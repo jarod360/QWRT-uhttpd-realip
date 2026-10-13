@@ -38,7 +38,7 @@ jobs:
           s = p.read_text()
           s = re.sub(r'^PKG_SOURCE_DATE:=.*$', 'PKG_SOURCE_DATE:=2026-08-03', s, flags=re.M)
           s = re.sub(r'^PKG_SOURCE_VERSION:=.*$', 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22', s, flags=re.M)
-          s = '\\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\\n'
+          s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
           if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
               raise SystemExit('Could not pin expected uhttpd source revision')
           p.write_text(s)
@@ -134,12 +134,12 @@ jobs:
           find bin/packages -type f -name 'uhttpd*.ipk' -exec cp -t ../realip/artifacts/ {} +
           test -n "$(find ../realip/artifacts -type f -name 'uhttpd_*.ipk' -print -quit)"
           CONTROL="$(ar p ../realip/artifacts/uhttpd_*.ipk control.tar.gz | tar -xzOf - ./control)"
-          printf '%s\\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
-          printf '%s\\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
-          printf '%s\\n' "$CONTROL" | grep -q 'libubox20240329'
-          printf '%s\\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
-          printf '%s\\n' "$CONTROL" | grep -q 'libjson-script20240329'
-          printf '%s\\n' "$CONTROL" | grep -q 'libjson-c5'
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
           find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} ;
 
       - name: Upload packages and build diagnostics
