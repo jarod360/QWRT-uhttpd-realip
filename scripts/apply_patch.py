@@ -51,7 +51,7 @@ r"""static void add_real_ip_trusted(const char *value)
     else if (inet_pton(AF_INET6, value, &entry->addr.in6) == 1)
         entry->addr.family = AF_INET6;
     else {
-        fprintf(stderr, "uhttpd: invalid trusted proxy address: %s\\n", value);
+        fprintf(stderr, "uhttpd: invalid trusted proxy address: %s\n", value);
         free(entry);
         exit(1);
     }
@@ -118,7 +118,7 @@ static bool real_ip_parse(const char *value, struct uh_addr *addr)
         return false;
 
     memcpy(buf, start, len);
-    buf[len] = '\\0';
+    buf[len] = '\0';
 
     memset(addr, 0, sizeof(*addr));
     if (inet_pton(AF_INET, buf, &addr->in) == 1) {
@@ -196,7 +196,7 @@ static void client_update_real_ip(struct client *cl)
         parts[i] = p;
         comma = strchr(p, ',');
         if (comma) {
-            *comma = '\\0';
+            *comma = '\0';
             p = comma + 1;
         } else if (i != count - 1) {
             goto out;
