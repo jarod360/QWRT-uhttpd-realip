@@ -159,71 +159,75 @@ static void client_update_real_ip(struct client *cl)
     char *copy = NULL, *p, *comma;
     char **parts = NULL;
     size_t count = 1, i;
-    bool found = false;
+    bool found = false, malformed = false;
 
     cl->peer_addr = cl->remote_addr;
 
     if (!real_ip_is_trusted(&cl->remote_addr))
         return;
 
-    /* X-Real-IP is authoritative when it is present exactly once and valid. */
-    if (real_ip_get_header(cl, "x-real-ip", &value) &&
-        !strchr(value, ',') && real_ip_parse(value, &candidate)) {
-        cl->peer_addr = candidate;
-        return;
-    }
+    /*
+     * Prefer X-Forwarded-For: it preserves the proxy chain and can identify
+     * the client across multiple trusted reverse proxies. Parse from right
+     * to left and stop at the first non-trusted address.
+     */
+    if (real_ip_get_header(cl, "x-forwarded-for", &value) && *value) {
+        for (p = (char *)value; *p; p++) {
+            if (*p == ',')
+                count++;
+        }
 
-    /* Reject ambiguous duplicate X-Forwarded-For fields. */
-    if (!real_ip_get_header(cl, "x-forwarded-for", &value) || !*value)
-        return;
+        if (count <= UH_LIMIT_HEADER_COUNT) {
+            copy = strdup(value);
+            parts = calloc(count, sizeof(*parts));
+            if (copy && parts) {
+                p = copy;
+                for (i = 0; i < count; i++) {
+                    parts[i] = p;
+                    comma = strchr(p, ',');
+                    if (comma) {
+                        *comma = '\0';
+                        p = comma + 1;
+                    } else if (i != count - 1) {
+                        malformed = true;
+                        break;
+                    }
+                }
 
-    for (p = (char *)value; *p; p++) {
-        if (*p == ',')
-            count++;
-    }
+                if (!malformed) {
+                    for (i = count; i > 0; i--) {
+                        if (!real_ip_parse(parts[i - 1], &candidate)) {
+                            malformed = true;
+                            break;
+                        }
 
-    /* The request header parser already caps total header count and bytes. */
-    if (count > UH_LIMIT_HEADER_COUNT)
-        return;
+                        if (real_ip_is_trusted(&candidate))
+                            continue;
 
-    copy = strdup(value);
-    parts = calloc(count, sizeof(*parts));
-    if (!copy || !parts)
-        goto out;
-
-    p = copy;
-    for (i = 0; i < count; i++) {
-        parts[i] = p;
-        comma = strchr(p, ',');
-        if (comma) {
-            *comma = '\0';
-            p = comma + 1;
-        } else if (i != count - 1) {
-            goto out;
+                        found = true;
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    /*
-     * The immediate TCP peer is trusted. Skip trusted proxy addresses
-     * from the right edge; the first valid non-trusted address is the
-     * client (or the nearest untrusted intermediary).
-     */
-    for (i = count; i > 0; i--) {
-        if (!real_ip_parse(parts[i - 1], &candidate))
-            goto out;
-
-        if (real_ip_is_trusted(&candidate))
-            continue;
-
+    if (found && !malformed)
         cl->peer_addr = candidate;
-        found = true;
-        break;
-    }
 
-    (void)found;
-out:
     free(parts);
     free(copy);
+
+    if (found && !malformed)
+        return;
+
+    /*
+     * X-Real-IP is the fallback for proxies that provide a single client IP
+     * but do not provide a usable X-Forwarded-For chain.
+     */
+    if (real_ip_get_header(cl, "x-real-ip", &value) &&
+        !strchr(value, ',') && real_ip_parse(value, &candidate))
+        cl->peer_addr = candidate;
 }
 
 static bool rfc1918_filter_check(struct client *cl)
