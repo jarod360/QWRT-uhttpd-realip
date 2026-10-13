@@ -122,7 +122,21 @@ jobs:
           make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
           SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
           test -n "$SOURCE_DIR"
+
+          # Patch the prepared source, then persist the three modified source files
+          # under package/.../src. The OpenWrt compile target may re-run Prepare,
+          # which would otherwise overwrite a direct build_dir patch.
           python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
+          mkdir -p package/network/services/uhttpd/src
+          cp -f "$SOURCE_DIR/uhttpd.h" package/network/services/uhttpd/src/uhttpd.h
+          cp -f "$SOURCE_DIR/main.c" package/network/services/uhttpd/src/main.c
+          cp -f "$SOURCE_DIR/client.c" package/network/services/uhttpd/src/client.c
+
+          echo '===== verify patched source before compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
           make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
 
       - name: Verify package architecture and ABI dependencies
@@ -137,13 +151,41 @@ jobs:
           test -n "$IPK"
           echo "===== inspect IPK archive: $IPK ====="
           tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk.
+          # Do not use "ar" here.
           CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
           printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
-          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+
           printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
           find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} ;
 
       - name: Upload packages and build diagnostics
