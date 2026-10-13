@@ -133,7 +133,11 @@ jobs:
           mkdir -p ../realip/artifacts
           find bin/packages -type f -name 'uhttpd*.ipk' -exec cp -t ../realip/artifacts/ {} +
           test -n "$(find ../realip/artifacts -type f -name 'uhttpd_*.ipk' -print -quit)"
-          CONTROL="$(ar p ../realip/artifacts/uhttpd_*.ipk control.tar.gz | tar -xzOf - ./control)"
+          IPK="$(find ../realip/artifacts -maxdepth 1 -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
           printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
           printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
           printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
