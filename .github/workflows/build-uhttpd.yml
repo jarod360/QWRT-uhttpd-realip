@@ -119,44 +119,86 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
           make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
           SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
           test -n "$SOURCE_DIR"
 
-          # Patch the prepared source, then persist the three modified source files
-          # under package/.../src. The OpenWrt compile target may re-run Prepare,
-          # which would otherwise overwrite a direct build_dir patch.
-          python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
-          mkdir -p package/network/services/uhttpd/src
-          cp -f "$SOURCE_DIR/uhttpd.h" package/network/services/uhttpd/src/uhttpd.h
-          cp -f "$SOURCE_DIR/main.c" package/network/services/uhttpd/src/main.c
-          cp -f "$SOURCE_DIR/client.c" package/network/services/uhttpd/src/client.c
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
 
-          echo '===== verify patched source before compile ====='
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
           grep -q -- '-z address' "$SOURCE_DIR/main.c"
           grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
           grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
 
-          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
-
-      - name: Verify package architecture and ABI dependencies
+      - name: Verify package architecture, ABI, and real-IP binary
         working-directory: openwrt
         run: |
           set -eu
           find bin/packages -type f -name 'uhttpd*.ipk' -print
           mkdir -p ../realip/artifacts
-          find bin/packages -type f -name 'uhttpd*.ipk' -exec cp -t ../realip/artifacts/ {} +
-          test -n "$(find ../realip/artifacts -type f -name 'uhttpd_*.ipk' -print -quit)"
-          IPK="$(find ../realip/artifacts -maxdepth 1 -type f -name 'uhttpd_*.ipk' -print -quit)"
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
           test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
           echo "===== inspect IPK archive: $IPK ====="
           tar -tzf "$IPK"
 
-          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk.
-          # Do not use "ar" here.
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
           CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
           printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
-          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
 
       - name: Upload packages and build diagnostics
         if: always()
