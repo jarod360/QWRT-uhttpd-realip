@@ -31,5 +31,7 @@ uci commit uhttpd
 - uhttpd: `60f64bec40c8113cf09815ec377761b1f4f95f22`
 - OpenWrt build system: ImmortalWrt `v24.10.6`
 - CI 工具链映射：`qualcommax/ipq807x`，软件包架构 `aarch64_cortex-a53`
+- uhttpd 软件包 release：`5`（高于 ImmortalWrt v24.10.6 原始 release `4`，用于覆盖升级前一版）
+- `files/uhttpd.init` 补丁具有幂等性，重复执行准备阶段也只保留一份函数和一条配置调用。
 
 QWRT 使用定制 QSDK 内核和软件包仓库。CI 产物用于验证源码与架构；安装前必须核对设备上的依赖 ABI 和包管理器依赖，不能仅凭 CPU 架构相同就认定完全兼容。
