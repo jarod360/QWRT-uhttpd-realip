@@ -36,13 +36,1443 @@ jobs:
 
           p = Path('package/network/services/uhttpd/Makefile')
           s = p.read_text()
-          s = re.sub(r'^PKG_SOURCE_DATE:=.*$', 'PKG_SOURCE_DATE:=2026-08-03', s, flags=re.M)
-          s = re.sub(r'^PKG_SOURCE_VERSION:=.*$', 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22', s, flags=re.M)
+          s = re.sub(r'^PKG_SOURCE_DATE:=.*          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          echo '===== verify init-script patch is not duplicated after Prepare ====='
+          python3 - <<'PY'
+          from pathlib import Path
+
+          init = Path('package/network/services/uhttpd/files/uhttpd.init').read_text()
+          helper_count = init.count('append_real_ip_trusted() {')
+          call_count = init.count('config_list_foreach "$cfg" set_real_ip_from append_real_ip_trusted')
+          print(f'append_real_ip_trusted function count: {helper_count}')
+          print(f'set_real_ip_from invocation count: {call_count}')
+          if helper_count != 1 or call_count != 1:
+              raise SystemExit('ERROR: duplicate trusted real-IP entries in uhttpd.init')
+          PY
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Version|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd > ../realip/artifacts/uhttpd.init
+          test "$(grep -Fc 'append_real_ip_trusted() {' ../realip/artifacts/uhttpd.init)" -eq 1
+          test "$(grep -Fc 'config_list_foreach "$cfg" set_real_ip_from append_real_ip_trusted' ../realip/artifacts/uhttpd.init)" -eq 1
+          grep -F -- 'command -z "$addr"' ../realip/artifacts/uhttpd.init
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, 'PKG_SOURCE_DATE:=2026-08-03', s, flags=re.M)
+          s = re.sub(r'^PKG_SOURCE_VERSION:=.*          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22', s, flags=re.M)
+          # ImmortalWrt v24.10.6 uses release 4; release 5 makes this patched
+          # package upgradeable over the previous build with the same source.
+          s = re.sub(r'^PKG_RELEASE:=.*          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, 'PKG_RELEASE:=5', s, flags=re.M)
           s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
           if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
               raise SystemExit('Could not pin expected uhttpd source revision')
+          if not re.search(r'^PKG_RELEASE:=5          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, s, flags=re.M):
+              raise SystemExit('Could not set uhttpd package release to 5')
           p.write_text(s)
-          print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22')
+          print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22, PKG_RELEASE=5')
+          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+
+          VERSION="$(printf '%s\n' "$CONTROL" | sed -n 's/^Version: //p')"
+          case "$VERSION" in
+            *-5) echo "OK: uhttpd package version is $VERSION (release 5)" ;;
+            *) echo "ERROR: expected uhttpd package release 5, got '$VERSION'"; exit 1 ;;
+          esac
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, 'PKG_SOURCE_DATE:=2026-08-03', s, flags=re.M)
+          s = re.sub(r'^PKG_SOURCE_VERSION:=.*          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22', s, flags=re.M)
+          # ImmortalWrt v24.10.6 uses release 4; release 5 makes this patched
+          # package upgradeable over the previous build with the same source.
+          s = re.sub(r'^PKG_RELEASE:=.*          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, 'PKG_RELEASE:=5', s, flags=re.M)
+          s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
+          if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
+              raise SystemExit('Could not pin expected uhttpd source revision')
+          if not re.search(r'^PKG_RELEASE:=5          PY
+
+      - name: Configure aarch64_cortex-a53 package architecture
+        working-directory: openwrt
+        run: |
+          # ImmortalWrt qualcommax/ipq807x supplies the Cortex-A53 target
+          # toolchain mapping; it is an architecture reference, not the QWRT board target.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq807x=y
+          EOF
+          make defconfig
+          echo '===== resolved package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
+          echo 'Architecture verified from .config; skipping make info (not required for package build).'
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_uhttpd=y
+          EOF
+          make defconfig
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j4
+
+      - name: Build host tools
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip/artifacts-host-tools.log
+
+      - name: Build target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip/artifacts-toolchain.log
+          if ! find staging_dir -path '*/libgcc_s.so*' -print -quit | grep -q .; then
+            echo 'ERROR: toolchain/install did not produce libgcc_s.so*'
+            find staging_dir -maxdepth 3 -type d -name lib -print
+            exit 1
+          fi
+
+      - name: Prepare, patch, and build uhttpd once
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          mkdir -p ../realip/artifacts
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
+          SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
+          test -n "$SOURCE_DIR"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
+
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
+        working-directory: openwrt
+        run: |
+          set -eu
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
+          mkdir -p ../realip/artifacts
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
+          test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
+          CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
+          printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
+
+      - name: Upload packages and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
+          path: |
+            realip/artifacts/*.ipk
+            realip/artifacts/*.log
+            realip/artifacts-host-tools.log
+            realip/artifacts-toolchain.log
+            realip/artifacts-lua.log
+          if-no-files-found: warn
+          retention-days: 30
+, s, flags=re.M):
+              raise SystemExit('Could not set uhttpd package release to 5')
+          p.write_text(s)
+          print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22, PKG_RELEASE=5')
           PY
 
       - name: Configure aarch64_cortex-a53 package architecture
