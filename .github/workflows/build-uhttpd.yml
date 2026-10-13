@@ -229,17 +229,3 @@ jobs:
           tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd | grep -F -- 'command -z "$addr"'
 
           find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} ;
-
-      - name: Upload packages and build diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: uhttpd-realip-immortalwrt-24.10.6-aarch64-cortex-a53
-          path: |
-            realip/artifacts/*.ipk
-            realip/artifacts/*.log
-            realip/artifacts-host-tools.log
-            realip/artifacts-toolchain.log
-            realip/artifacts-lua.log
-          if-no-files-found: warn
-          retention-days: 30
