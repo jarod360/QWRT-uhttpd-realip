@@ -238,11 +238,82 @@ replace_once("client.c",
 replace_once("client.c", "\tset_addr(&cl->peer_addr, &addr);\n\tsl = sizeof(addr);",
     "\tset_addr(&cl->peer_addr, &addr);\n\tcl->remote_addr = cl->peer_addr;\n\tsl = sizeof(addr);")
 
-replace_once(str(PACKAGE / "files/uhttpd.init"), "append_bool() {\n",
-    'append_real_ip_trusted() {\n\tlocal addr="$1"\n\t[ -n "$addr" ] && procd_append_param command -z "$addr"\n}\n\nappend_bool() {\n')
-replace_once(str(PACKAGE / "files/uhttpd.init"),
-    '\tappend_bool "$cfg" rfc1918_filter "-R" 0\n',
-    '\tappend_bool "$cfg" rfc1918_filter "-R" 0\n'
-    '\tconfig_list_foreach "$cfg" set_real_ip_from append_real_ip_trusted\n')
+def patch_init_script():
+    """Patch files/uhttpd.init idempotently.
 
+    OpenWrt can invoke Build/Prepare more than once during a package build.
+    The package files directory persists between those invocations, so the
+    init-script edits must never append duplicate helpers or command options.
+    """
+    init_file = PACKAGE / "files/uhttpd.init"
+    content = init_file.read_text()
+
+    function_start = "append_real_ip_trusted() {"
+    function_block = (
+        'append_real_ip_trusted() {\n'
+        '\tlocal addr="$1"\n'
+        '\t[ -n "$addr" ] && procd_append_param command -z "$addr"\n'
+        '}\n\n'
+    )
+
+    # Keep only the first complete definition if an older run left duplicates.
+    lines = content.splitlines(keepends=True)
+    output = []
+    function_seen = False
+    skip_duplicate_function = False
+    for line in lines:
+        if line.strip() == function_start:
+            if function_seen:
+                skip_duplicate_function = True
+                continue
+            function_seen = True
+
+        if skip_duplicate_function:
+            if line.strip() == "}":
+                skip_duplicate_function = False
+            continue
+
+        output.append(line)
+
+    content = "".join(output)
+    if not function_seen:
+        anchor = "append_bool() {\n"
+        count = content.count(anchor)
+        if count != 1:
+            raise SystemExit(
+                f"{init_file}: expected one append_bool anchor, found {count}"
+            )
+        content = content.replace(anchor, function_block + anchor, 1)
+
+    # Likewise, retain only one invocation of the trusted-proxy option helper.
+    call_marker = "config_list_foreach"
+    call_target = "set_real_ip_from"
+    call_helper = "append_real_ip_trusted"
+    call_line = (
+        '\tconfig_list_foreach "$cfg" set_real_ip_from '
+        'append_real_ip_trusted\n'
+    )
+    output = []
+    call_seen = False
+    for line in content.splitlines(keepends=True):
+        if call_marker in line and call_target in line and call_helper in line:
+            if call_seen:
+                continue
+            call_seen = True
+        output.append(line)
+
+    content = "".join(output)
+    if not call_seen:
+        anchor = '\tappend_bool "$cfg" rfc1918_filter "-R" 0\n'
+        count = content.count(anchor)
+        if count != 1:
+            raise SystemExit(
+                f"{init_file}: expected one rfc1918_filter anchor, found {count}"
+            )
+        content = content.replace(anchor, anchor + call_line, 1)
+
+    init_file.write_text(content)
+
+
+patch_init_script()
 print("Applied trusted X-Real-IP and X-Forwarded-For support to uhttpd.")
