@@ -200,8 +200,8 @@ jobs:
           printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
           VERSION="$(printf '%s\n' "$CONTROL" | sed -n 's/^Version: //p')"
           case "$VERSION" in
-            *-5) echo "OK: uhttpd package version is $VERSION (release 5)" ;;
-            *) echo "ERROR: expected uhttpd package release 5, got '$VERSION'"; exit 1 ;;
+            *-r5) echo "OK: uhttpd package version is $VERSION (release 5)" ;;
+            *) echo "ERROR: expected uhttpd package release 5 (-r5), got '$VERSION'"; exit 1 ;;
           esac
           printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
