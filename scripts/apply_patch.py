@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply trusted X-Real-IP changes to pinned upstream uhttpd source."""
+"""Apply trusted X-Real-IP and X-Forwarded-For support to pinned uhttpd."""
 from pathlib import Path
 import sys
 
@@ -24,7 +24,7 @@ replace_once("uhttpd.h",
 replace_once("uhttpd.h",
     "struct sni_redirect {\n\tstruct list_head list;\n\tconst char *host;\n\tconst char *url;\n};",
     "struct sni_redirect {\n\tstruct list_head list;\n\tconst char *host;\n\tconst char *url;\n};\n\nstruct real_ip_trusted {\n\tstruct list_head list;\n\tstruct uh_addr addr;\n};")
-# Append the new member to preserve offsets of existing struct client members
+# Append this field to preserve offsets of existing struct client members
 # consumed by separately-built uhttpd plugins.
 replace_once("uhttpd.h", "\tstruct dispatch dispatch;\n};",
     "\tstruct dispatch dispatch;\n\tstruct uh_addr remote_addr;\n};")
@@ -32,7 +32,7 @@ replace_once("uhttpd.h", "\tstruct dispatch dispatch;\n};",
 replace_once("main.c", "#include <sys/socket.h>\n#include <netinet/in.h>",
     "#include <sys/socket.h>\n#include <arpa/inet.h>\n#include <netinet/in.h>")
 replace_once("main.c", r"Enable RFC1918 filter\n",
-    r"Enable RFC1918 filter\n\t-z address      Trust this reverse proxy for X-Real-IP (repeatable)\n")
+    r"Enable RFC1918 filter\n\t-z address      Trust this reverse proxy for forwarded client IP headers (repeatable)\n")
 replace_once("main.c", "\tINIT_LIST_HEAD(&conf.sni_redirect);\n}",
     "\tINIT_LIST_HEAD(&conf.sni_redirect);\n\tINIT_LIST_HEAD(&conf.real_ip_trusted);\n}")
 replace_once("main.c", "static void init_defaults_post(void)\n{",
@@ -51,7 +51,7 @@ r"""static void add_real_ip_trusted(const char *value)
     else if (inet_pton(AF_INET6, value, &entry->addr.in6) == 1)
         entry->addr.family = AF_INET6;
     else {
-        fprintf(stderr, "uhttpd: invalid trusted proxy address: %s\n", value);
+        fprintf(stderr, "uhttpd: invalid trusted proxy address: %s\\n", value);
         free(entry);
         exit(1);
     }
@@ -68,66 +68,162 @@ replace_once("main.c", "\t\tcase 'R':\n\t\t\tconf.rfc1918_filter = 1;\n\t\t\tbre
     "\t\tcase 'R':\n\t\t\tconf.rfc1918_filter = 1;\n\t\t\tbreak;\n\n\t\tcase 'z':\n\t\t\tadd_real_ip_trusted(optarg);\n\t\t\tbreak;\n")
 
 replace_once("client.c", " */\n\n#include <libubox/blobmsg.h>",
-    " */\n\n#include <arpa/inet.h>\n#include <libubox/blobmsg.h>")
+    " */\n\n#include <arpa/inet.h>\n#include <ctype.h>\n#include <libubox/blobmsg.h>")
 replace_once("client.c", "static bool rfc1918_filter_check(struct client *cl)\n{",
 r"""/*
- * X-Real-IP is accepted only when the TCP peer is explicitly trusted.
- * remote_addr is immutable for the lifetime of the connection; peer_addr
- * is reset from it for every request to prevent keep-alive state leakage.
+ * Only explicitly trusted TCP peers may supply forwarding headers.
+ * Walk X-Forwarded-For from right to left, skipping trusted proxy hops.
+ * The raw TCP peer is immutable and peer_addr is reset on every request.
  */
+static bool real_ip_addr_equal(const struct uh_addr *a, const struct uh_addr *b)
+{
+    if (a->family != b->family)
+        return false;
+
+    if (a->family == AF_INET)
+        return a->in.s_addr == b->in.s_addr;
+
+    if (a->family == AF_INET6)
+        return !memcmp(&a->in6, &b->in6, sizeof(struct in6_addr));
+
+    return false;
+}
+
+static bool real_ip_is_trusted(const struct uh_addr *addr)
+{
+    struct real_ip_trusted *entry;
+
+    list_for_each_entry(entry, &conf.real_ip_trusted, list) {
+        if (real_ip_addr_equal(addr, &entry->addr))
+            return true;
+    }
+
+    return false;
+}
+
+static bool real_ip_parse(const char *value, struct uh_addr *addr)
+{
+    char buf[INET6_ADDRSTRLEN];
+    const char *start = value;
+    size_t len;
+
+    while (*start && isspace((unsigned char)*start))
+        start++;
+
+    len = strlen(start);
+    while (len && isspace((unsigned char)start[len - 1]))
+        len--;
+
+    if (!len || len >= sizeof(buf))
+        return false;
+
+    memcpy(buf, start, len);
+    buf[len] = '\\0';
+
+    memset(addr, 0, sizeof(*addr));
+    if (inet_pton(AF_INET, buf, &addr->in) == 1) {
+        addr->family = AF_INET;
+        return true;
+    }
+
+    if (inet_pton(AF_INET6, buf, &addr->in6) == 1) {
+        addr->family = AF_INET6;
+        return true;
+    }
+
+    return false;
+}
+
+static bool real_ip_get_header(struct client *cl, const char *name,
+                               const char **value)
+{
+    struct blob_attr *cur;
+    int rem, matches = 0;
+
+    *value = NULL;
+    blob_for_each_attr(cur, cl->hdr.head, rem) {
+        if (strcmp(blobmsg_name(cur), name))
+            continue;
+
+        matches++;
+        *value = blobmsg_get_string(cur);
+    }
+
+    return matches == 1 && *value;
+}
+
 static void client_update_real_ip(struct client *cl)
 {
-    struct real_ip_trusted *trusted;
-    struct blob_attr *cur;
-    struct uh_addr candidate = { 0 };
+    struct uh_addr candidate;
     const char *value = NULL;
-    int matches = 0, rem;
-    bool allowed = false;
+    char *copy = NULL, *p, *comma;
+    char **parts = NULL;
+    size_t count = 1, i;
+    bool found = false;
 
     cl->peer_addr = cl->remote_addr;
 
-    list_for_each_entry(trusted, &conf.real_ip_trusted, list) {
-        if (trusted->addr.family != cl->remote_addr.family)
-            continue;
+    if (!real_ip_is_trusted(&cl->remote_addr))
+        return;
 
-        if (trusted->addr.family == AF_INET &&
-            trusted->addr.in.s_addr == cl->remote_addr.in.s_addr)
-            allowed = true;
-        else if (trusted->addr.family == AF_INET6 &&
-                 !memcmp(&trusted->addr.in6, &cl->remote_addr.in6,
-                         sizeof(struct in6_addr)))
-            allowed = true;
-
-        if (allowed)
-            break;
+    /* X-Real-IP is authoritative when it is present exactly once and valid. */
+    if (real_ip_get_header(cl, "x-real-ip", &value) &&
+        !strchr(value, ',') && real_ip_parse(value, &candidate)) {
+        cl->peer_addr = candidate;
+        return;
     }
 
-    if (!allowed)
+    /* Reject ambiguous duplicate X-Forwarded-For fields. */
+    if (!real_ip_get_header(cl, "x-forwarded-for", &value) || !*value)
         return;
 
-    blob_for_each_attr(cur, cl->hdr.head, rem) {
-        if (strcmp(blobmsg_name(cur), "x-real-ip"))
-            continue;
-        matches++;
-        value = blobmsg_get_string(cur);
+    for (p = (char *)value; *p; p++) {
+        if (*p == ',')
+            count++;
     }
 
-    /* Reject duplicate values and comma-separated proxy chains. */
-    if (matches != 1 || !value || strchr(value, ','))
+    /* The request header parser already caps total header count and bytes. */
+    if (count > UH_LIMIT_HEADER_COUNT)
         return;
 
-    if (inet_pton(AF_INET, value, &candidate.in) == 1)
-        candidate.family = AF_INET;
-    else if (inet_pton(AF_INET6, value, &candidate.in6) == 1)
-        candidate.family = AF_INET6;
-    else
-        return;
+    copy = strdup(value);
+    parts = calloc(count, sizeof(*parts));
+    if (!copy || !parts)
+        goto out;
 
-    cl->peer_addr.family = candidate.family;
-    if (candidate.family == AF_INET)
-        cl->peer_addr.in = candidate.in;
-    else
-        cl->peer_addr.in6 = candidate.in6;
+    p = copy;
+    for (i = 0; i < count; i++) {
+        parts[i] = p;
+        comma = strchr(p, ',');
+        if (comma) {
+            *comma = '\\0';
+            p = comma + 1;
+        } else if (i != count - 1) {
+            goto out;
+        }
+    }
+
+    /*
+     * The immediate TCP peer is trusted. Skip trusted proxy addresses
+     * from the right edge; the first valid non-trusted address is the
+     * client (or the nearest untrusted intermediary).
+     */
+    for (i = count; i > 0; i--) {
+        if (!real_ip_parse(parts[i - 1], &candidate))
+            goto out;
+
+        if (real_ip_is_trusted(&candidate))
+            continue;
+
+        cl->peer_addr = candidate;
+        found = true;
+        break;
+    }
+
+    (void)found;
+out:
+    free(parts);
+    free(copy);
 }
 
 static bool rfc1918_filter_check(struct client *cl)
@@ -145,4 +241,4 @@ replace_once(str(PACKAGE / "files/uhttpd.init"),
     '\tappend_bool "$cfg" rfc1918_filter "-R" 0\n'
     '\tconfig_list_foreach "$cfg" set_real_ip_from append_real_ip_trusted\n')
 
-print("Applied trusted X-Real-IP support to uhttpd source and init script.")
+print("Applied trusted X-Real-IP and X-Forwarded-For support to uhttpd.")
