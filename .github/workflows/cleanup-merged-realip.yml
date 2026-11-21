@@ -1,0 +1,22 @@
+name: Cleanup merged RealIP branches (one shot)
+on:
+  push:
+    branches: [realip-dev]
+    paths:
+      - '.github/workflows/cleanup-merged-realip.yml'
+permissions:
+  contents: write
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Remove obsolete merged feature and dev branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          echo "Main branch: $(gh api "repos/$GH_REPO/branches/main" --jq '.commit.sha')"
+          gh api -X DELETE "repos/$GH_REPO/git/refs/heads/feat/realip-disabled-by-default"
+          gh api -X DELETE "repos/$GH_REPO/git/refs/heads/realip-dev"
+          echo 'Deleted obsolete feature and realip-dev refs; main retained.'
