@@ -79,7 +79,7 @@ jobs:
 
       - name: Download sources
         working-directory: openwrt
-        run: make download -j4
+        run: make package/network/services/uhttpd/download -j4
 
       - name: Build host tools and target toolchain
         working-directory: openwrt
