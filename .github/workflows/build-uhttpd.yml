@@ -58,9 +58,9 @@ jobs:
           if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
               raise SystemExit('Could not pin expected uhttpd source revision')
           if not re.search(r'^PKG_RELEASE:=6$', s, flags=re.M):
-              raise SystemExit('Could not set uhttpd package release to 5')
+              raise SystemExit('Could not set uhttpd package release to 6')
           p.write_text(s)
-          print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22, PKG_RELEASE=5')
+          print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22, PKG_RELEASE=6')
           PY
 
       - name: Configure aarch64_cortex-a53 package architecture
