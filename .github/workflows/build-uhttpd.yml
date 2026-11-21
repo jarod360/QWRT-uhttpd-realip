@@ -51,13 +51,13 @@ jobs:
           s = p.read_text()
           s = re.sub(r'^PKG_SOURCE_DATE:=.*$', 'PKG_SOURCE_DATE:=2026-08-03', s, flags=re.M)
           s = re.sub(r'^PKG_SOURCE_VERSION:=.*$', 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22', s, flags=re.M)
-          # ImmortalWrt v24.10.6 uses release 4; release 5 makes this patched
+          # ImmortalWrt v24.10.6 uses release 4; release 6 makes this patched
           # package upgradeable over the previous build with the same source.
-          s = re.sub(r'^PKG_RELEASE:=.*$', 'PKG_RELEASE:=5', s, flags=re.M)
+          s = re.sub(r'^PKG_RELEASE:=.*$', 'PKG_RELEASE:=6', s, flags=re.M)
           s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
           if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
               raise SystemExit('Could not pin expected uhttpd source revision')
-          if not re.search(r'^PKG_RELEASE:=5$', s, flags=re.M):
+          if not re.search(r'^PKG_RELEASE:=6$', s, flags=re.M):
               raise SystemExit('Could not set uhttpd package release to 5')
           p.write_text(s)
           print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22, PKG_RELEASE=5')
@@ -215,8 +215,8 @@ jobs:
           printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
           VERSION="$(printf '%s\n' "$CONTROL" | sed -n 's/^Version: //p')"
           case "$VERSION" in
-            *-r5) echo "OK: uhttpd package version is $VERSION (release 5)" ;;
-            *) echo "ERROR: expected uhttpd package release 5 (-r5), got '$VERSION'"; exit 1 ;;
+            *-r6) echo "OK: uhttpd package version is $VERSION (release 6)" ;;
+            *) echo "ERROR: expected uhttpd package release 6 (-r6), got '$VERSION'"; exit 1 ;;
           esac
           printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
