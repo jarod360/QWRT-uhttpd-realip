@@ -1,8 +1,8 @@
-name: Build uhttpd with trusted X-Real-IP
+name: Build uhttpd with trusted real-IP headers
 
 on:
   push:
-    branches: [main, 'feat/realip-disabled-by-default']
+    branches: [main]
     paths:
       - '.github/workflows/**'
       - 'scripts/**'
@@ -28,7 +28,7 @@ jobs:
         with:
           path: realip
 
-      - name: Validate RealIP source patcher
+      - name: Check patcher syntax
         run: python3 -m py_compile realip/scripts/apply_patch.py
 
       - name: Install build dependencies
@@ -47,11 +47,16 @@ jobs:
           s = p.read_text()
           s = re.sub(r'^PKG_SOURCE_DATE:=.*$', 'PKG_SOURCE_DATE:=2026-08-03', s, flags=re.M)
           s = re.sub(r'^PKG_SOURCE_VERSION:=.*$', 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22', s, flags=re.M)
+          # ImmortalWrt v24.10.6 uses release 4; release 5 makes this patched
+          # package upgradeable over the previous build with the same source.
+          s = re.sub(r'^PKG_RELEASE:=.*$', 'PKG_RELEASE:=5', s, flags=re.M)
           s = '\n'.join(line for line in s.splitlines() if not line.startswith('PKG_MIRROR_HASH:=')) + '\n'
           if 'PKG_SOURCE_VERSION:=60f64bec40c8113cf09815ec377761b1f4f95f22' not in s:
               raise SystemExit('Could not pin expected uhttpd source revision')
+          if not re.search(r'^PKG_RELEASE:=5$', s, flags=re.M):
+              raise SystemExit('Could not set uhttpd package release to 5')
           p.write_text(s)
-          print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22')
+          print('Pinned uhttpd source to 60f64bec40c8113cf09815ec377761b1f4f95f22, PKG_RELEASE=5')
           PY
 
       - name: Configure aarch64_cortex-a53 package architecture
@@ -70,18 +75,37 @@ jobs:
           echo 'Architecture verified from .config; skipping make info (not required for package build).'
           cat >> .config <<'EOF'
           CONFIG_PACKAGE_uhttpd=y
-          CONFIG_PACKAGE_uhttpd-mod-lua=y
-          CONFIG_PACKAGE_liblua=y
-          CONFIG_PACKAGE_uhttpd-mod-ubus=y
-          CONFIG_PACKAGE_uhttpd-mod-ucode=y
           EOF
           make defconfig
-          grep -q '^CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"$' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd=y' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd-mod-lua=y' .config
-          grep -q '^CONFIG_PACKAGE_liblua=y' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ubus=y' .config
-          grep -q '^CONFIG_PACKAGE_uhttpd-mod-ucode=y' .config
+
+          echo '===== final package architecture ====='
+          grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config || {
+            echo 'ERROR: package architecture mismatch'
+            exit 1
+          }
+
+          echo '===== uhttpd core package configuration ====='
+          if grep -qx 'CONFIG_PACKAGE_uhttpd=y' .config; then
+            echo 'OK: CONFIG_PACKAGE_uhttpd=y'
+          else
+            echo 'ERROR: uhttpd core package is not enabled'
+            grep -E '^CONFIG_PACKAGE_uhttpd=' .config || echo 'CONFIG_PACKAGE_uhttpd is unset'
+            exit 1
+          fi
+
+          echo '===== optional uhttpd plugin configuration (diagnostic only) ====='
+          for sym in \
+            CONFIG_PACKAGE_uhttpd-mod-lua \
+            CONFIG_PACKAGE_liblua \
+            CONFIG_PACKAGE_uhttpd-mod-ubus \
+            CONFIG_PACKAGE_uhttpd-mod-ucode; do
+            if grep -qx "${sym}=y" .config; then
+              echo "INFO: ${sym}=y"
+            else
+              echo "INFO: ${sym} is not enabled; this does not block the core uhttpd build"
+            fi
+          done
 
       - name: Download sources
         working-directory: openwrt
@@ -104,49 +128,119 @@ jobs:
             exit 1
           fi
 
-      - name: Build Lua runtime dependency
-        working-directory: openwrt
-        run: |
-          set -o pipefail
-          make package/utils/lua/compile V=s -j1 2>&1 | tee ../realip/artifacts-lua.log
-
-      - name: Apply opt-in RealIP changes BEFORE building uhttpd
+      - name: Prepare, patch, and build uhttpd once
         working-directory: openwrt
         run: |
           set -o pipefail
           mkdir -p ../realip/artifacts
-          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare-build.log
+
+          # Run the real-IP patch as part of OpenWrt's Build/Prepare.
+          # The compile target can invoke Prepare again; patching only the
+          # build_dir after Prepare is therefore not sufficient.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('package/network/services/uhttpd/Makefile')
+          s = p.read_text()
+          anchor = '$(eval $(call BuildPackage,uhttpd))'
+          block = '''define Build/Prepare
+          $(call Build/Prepare/Default)
+          	python3 $(TOPDIR)/../realip/scripts/apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"
+          endef
+
+          '''
+          if 'apply_patch.py "$(PKG_BUILD_DIR)" "$(CURDIR)"' not in s:
+              if anchor not in s:
+                  raise SystemExit('Could not find uhttpd BuildPackage anchor')
+              s = s.replace(anchor, block + anchor, 1)
+              p.write_text(s)
+          print('Installed uhttpd Build/Prepare patch hook.')
+          PY
+
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
+
           SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
           test -n "$SOURCE_DIR"
-          python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
+
+          echo '===== verify patched source after Prepare ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+          grep -q 'command -z "$addr"' package/network/services/uhttpd/files/uhttpd.init
+          grep -Fq 'config_get_bool realip_enabled "$cfg" realip_enabled 0' package/network/services/uhttpd/files/uhttpd.init
+          grep -Fq "option realip_enabled '0'" package/network/services/uhttpd/files/uhttpd.config
+
+          echo '===== verify init-script patch is not duplicated after Prepare ====='
+          python3 - <<'PY'
+          from pathlib import Path
+
+          init = Path('package/network/services/uhttpd/files/uhttpd.init').read_text()
+          helper_count = init.count('append_real_ip_trusted() {')
+          call_count = init.count('config_list_foreach "$cfg" set_real_ip_from append_real_ip_trusted')
+          print(f'append_real_ip_trusted function count: {helper_count}')
+          print(f'set_real_ip_from invocation count: {call_count}')
+          if helper_count != 1 or call_count != 1:
+              raise SystemExit('ERROR: duplicate trusted real-IP entries in uhttpd.init')
+          PY
+
           make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
 
-      - name: Verify package architecture and ABI dependencies
+          echo '===== verify patched source after Compile ====='
+          grep -q -- '-z address' "$SOURCE_DIR/main.c"
+          grep -q 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -q 'real_ip_trusted' "$SOURCE_DIR/uhttpd.h"
+
+      - name: Verify package architecture, ABI, and real-IP binary
         working-directory: openwrt
         run: |
           set -eu
-          find bin -type f -name 'uhttpd*.ipk' -print
+          find bin/packages -type f -name 'uhttpd*.ipk' -print
           mkdir -p ../realip/artifacts
-          find bin -type f -name 'uhttpd*.ipk' -exec cp -t ../realip/artifacts/ {} +
-          test -n "$(find ../realip/artifacts -type f -name 'uhttpd_*.ipk' -print -quit)"
-          IPK="$(find ../realip/artifacts -maxdepth 1 -name 'uhttpd_*.ipk' -print -quit)"
+
+          IPK="$(find bin/packages -type f -name 'uhttpd_*.ipk' -print -quit)"
           test -n "$IPK"
+          cp -f "$IPK" ../realip/artifacts/
+
+          echo "===== inspect IPK archive: $IPK ====="
+          tar -tzf "$IPK"
+
+          # OpenWrt 24.10 uses a gzip-compressed tar container for .ipk:
+          # debian-binary + data.tar.gz + control.tar.gz.
           CONTROL="$(tar -xzOf "$IPK" ./control.tar.gz | tar -xzOf - ./control)"
-          printf '%s\n' "$CONTROL" | grep -E '^(Package|Architecture|Depends):'
+          printf '%s\n' "$CONTROL" | grep -E '^(Package|Version|Architecture|Depends):'
           printf '%s\n' "$CONTROL" | grep -q '^Architecture: aarch64_cortex-a53$'
+          VERSION="$(printf '%s\n' "$CONTROL" | sed -n 's/^Version: //p')"
+          case "$VERSION" in
+            *-r5) echo "OK: uhttpd package version is $VERSION (release 5)" ;;
+            *) echo "ERROR: expected uhttpd package release 5 (-r5), got '$VERSION'"; exit 1 ;;
+          esac
           printf '%s\n' "$CONTROL" | grep -q 'libubox20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libblobmsg-json20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libjson-script20240329'
           printf '%s\n' "$CONTROL" | grep -q 'libjson-c5'
-          CHECK_DIR=../realip/artifacts/package-check
-          mkdir -p "$CHECK_DIR"
-          tar -xzOf "$IPK" ./data.tar.gz | tar -xz -C "$CHECK_DIR" -f -
-          grep -Fq "option realip_enabled '0'" "$CHECK_DIR/etc/config/uhttpd"
-          grep -Fq 'config_get_bool realip_enabled "$cfg" realip_enabled 0' "$CHECK_DIR/etc/init.d/uhttpd"
-          grep -Fq 'config_list_foreach "$cfg" set_real_ip_from append_realip_proxy' "$CHECK_DIR/etc/init.d/uhttpd"
-          strings "$CHECK_DIR/usr/sbin/uhttpd" | grep -F 'ignoring invalid trusted proxy IP'
-          echo 'OK: package contains disabled RealIP defaults, init plumbing and modified uhttpd binary'
-          find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c 'file "$1"; readelf -d "$1" | grep NEEDED || true' sh {} ;
+
+          echo '===== verify patched uhttpd binary inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./usr/sbin/uhttpd > ../realip/artifacts/uhttpd
+          file ../realip/artifacts/uhttpd
+          strings -a ../realip/artifacts/uhttpd | grep -F -- '-z address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'invalid trusted proxy address'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-forwarded-for'
+          strings -a ../realip/artifacts/uhttpd | grep -F 'x-real-ip'
+
+          echo '===== verify patched init script inside IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/init.d/uhttpd > ../realip/artifacts/uhttpd.init
+          test "$(grep -Fc 'append_real_ip_trusted() {' ../realip/artifacts/uhttpd.init)" -eq 1
+          test "$(grep -Fc 'config_list_foreach "$cfg" set_real_ip_from append_real_ip_trusted' ../realip/artifacts/uhttpd.init)" -eq 1
+          grep -F -- 'command -z "$addr"' ../realip/artifacts/uhttpd.init
+          grep -Fq 'config_get_bool realip_enabled "$cfg" realip_enabled 0' ../realip/artifacts/uhttpd.init
+          echo '===== verify default-off UCI configuration in IPK ====='
+          tar -xzOf "$IPK" ./data.tar.gz | tar -xzOf - ./etc/config/uhttpd > ../realip/artifacts/uhttpd.config
+          grep -Fq "option realip_enabled '0'" ../realip/artifacts/uhttpd.config
+          echo 'OK: packaged RealIP defaults are disabled and init requires explicit enable'
+
+          echo '===== verify ELF and dependencies ====='
+          file ../realip/artifacts/uhttpd
+          readelf -d ../realip/artifacts/uhttpd | grep NEEDED || true
 
       - name: Upload packages and build diagnostics
         if: always()
