@@ -66,7 +66,7 @@ uci commit uhttpd
 ## 3. 可信代理规则及安全边界
 
 - 信任的是**直接连接路由器 uhttpd 的反向代理 IP**，不是客户端 IP。
-- `set_real_ip_from` 支持单个 IPv4 或 IPv6 地址；当前版本**不支持 CIDR 或带端口地址**。
+- `set_real_ip_from` 支持单个 IPv4 或 IPv6 地址；当前版本**不支持 CIDR 或带端口地址**。 输入不合法时仅记录警告并忽略该条目，不会因此中止 uhttpd 进程。
 - 未启用、无可信代理、TCP 来源未命中，或者 `X-Forwarded-For` 与 `X-Real-IP` 都不可用时，保留真实 TCP 来源 IP。对同一 Keep-Alive 连接的每个请求都会重新计算，不继承上次结果。
 - HTTP 请求可伪造 `X-Real-IP` 和 `X-Forwarded-For`：反向代理必须**覆盖**该请求头，不能无条件转发外部客户端传入的同名头；不要信任大网段或未知代理。
 - 仅应用层 `REMOTE_ADDR` 等基于 uhttpd 连接地址的数据发生变化，TCP 套接字来源、防火墙和连接路由不会变化。
