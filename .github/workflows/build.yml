@@ -2,7 +2,7 @@ name: Build uhttpd with trusted X-Real-IP
 
 on:
   push:
-    branches: [main, 'feat/realip-disabled-by-default']
+    branches: [main]
     paths:
       - '.github/workflows/**'
       - 'scripts/**'
@@ -81,16 +81,44 @@ jobs:
         working-directory: openwrt
         run: make download -j4
 
+      - name: Build host tools and target toolchain
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make tools/install -j2 V=s 2>&1 | tee ../realip-host-tools.log
+          make toolchain/install -j1 V=s 2>&1 | tee ../realip-toolchain.log
+
       - name: Apply real-IP changes and build packages
         working-directory: openwrt
         run: |
           mkdir -p ../realip/artifacts
-          make package/network/services/uhttpd/prepare V=s
+          # Insert patch in Build/Prepare, so subsequent Compile cannot
+          # regenerate an unmodified uhttpd source tree or overwrite init/config.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("package/network/services/uhttpd/Makefile")
+          text = p.read_text()
+          anchor = "$(eval $(call BuildPackage,uhttpd))"
+          hook = (
+              "define Build/Prepare\n"
+              "\t$(call Build/Prepare/Default)\n"
+              "\tpython3 $(TOPDIR)/../realip/scripts/apply_patch.py \"$(PKG_BUILD_DIR)\" \"$(CURDIR)\"\n"
+              "endef\n\n"
+          )
+          if text.count(anchor) != 1:
+              raise SystemExit("Cannot locate uhttpd build anchor")
+          text = text.replace(anchor, hook + anchor, 1)
+          p.write_text(text)
+          PY
+          set -o pipefail
+          make package/network/services/uhttpd/prepare V=s -j1 2>&1 | tee ../realip/artifacts/prepare.log
           SOURCE_DIR="$(find build_dir -maxdepth 3 -type d -name 'uhttpd-*' -print -quit)"
           test -n "$SOURCE_DIR"
-          python3 ../realip/scripts/apply_patch.py "$SOURCE_DIR" "$PWD/package/network/services/uhttpd"
-          set -o pipefail
-          make package/network/services/uhttpd/compile V=s -j2 2>&1 | tee ../realip/artifacts/build.log
+          grep -Fq 'client_update_real_ip' "$SOURCE_DIR/client.c"
+          grep -Fq 'config_get_bool realip_enabled "$cfg" realip_enabled 0' package/network/services/uhttpd/files/uhttpd.init
+          grep -Fq "option realip_enabled '0'" package/network/services/uhttpd/files/uhttpd.config
+          make package/network/services/uhttpd/compile V=s -j1 2>&1 | tee ../realip/artifacts/build.log
 
       - name: Verify package architecture and ELF dependencies
         working-directory: openwrt
@@ -111,7 +139,10 @@ jobs:
           tar -xzOf "$IPK" ./data.tar.gz | tar -xz -C "$CHECK_DIR" -f -
           grep -Fq "option realip_enabled '0'" "$CHECK_DIR/etc/config/uhttpd"
           grep -Fq 'config_get_bool realip_enabled "$cfg" realip_enabled 0' "$CHECK_DIR/etc/init.d/uhttpd"
-          strings "$CHECK_DIR/usr/sbin/uhttpd" | grep -F 'ignoring invalid trusted proxy IP'
+          strings "$CHECK_DIR/usr/sbin/uhttpd" | grep -F 'invalid trusted proxy address'
+          strings "$CHECK_DIR/usr/sbin/uhttpd" | grep -F 'x-forwarded-for'
+          strings "$CHECK_DIR/usr/sbin/uhttpd" | grep -F 'x-real-ip'
+          grep -Fq 'config_list_foreach "$cfg" set_real_ip_from' "$CHECK_DIR/etc/init.d/uhttpd"
           echo 'OK: packaged uhttpd, init and default config verified'
           find build_dir -type f -path '*/uhttpd-*/*' -name uhttpd -exec sh -c '
             file "$1"
@@ -125,5 +156,8 @@ jobs:
           path: |
             realip/artifacts/*.ipk
             realip/artifacts/build.log
+            realip/artifacts/prepare.log
+            realip-host-tools.log
+            realip-toolchain.log
           if-no-files-found: warn
           retention-days: 30
