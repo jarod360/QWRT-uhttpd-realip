@@ -43,7 +43,7 @@ r"""static void add_real_ip_trusted(const char *value)
     entry = calloc(1, sizeof(*entry));
     if (!entry) {
         perror("calloc");
-        exit(1);
+        return;
     }
 
     if (inet_pton(AF_INET, value, &entry->addr.in) == 1)
@@ -51,9 +51,9 @@ r"""static void add_real_ip_trusted(const char *value)
     else if (inet_pton(AF_INET6, value, &entry->addr.in6) == 1)
         entry->addr.family = AF_INET6;
     else {
-        fprintf(stderr, "uhttpd: invalid trusted proxy address: %s\n", value);
+        fprintf(stderr, "uhttpd: invalid trusted proxy address: %s (ignored)\n", value);
         free(entry);
-        exit(1);
+        return;
     }
 
     list_add_tail(&entry->list, &conf.real_ip_trusted);
