@@ -1,12 +1,6 @@
 name: Build uhttpd with trusted X-Real-IP
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/**'
-      - 'scripts/**'
-      - 'README.md'
   workflow_dispatch:
 
 concurrency:
