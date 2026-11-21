@@ -1,252 +1,342 @@
 #!/usr/bin/env python3
-"""Apply a fail-closed, trusted X-Real-IP extension to the pinned uhttpd source.
-
-Usage: apply_patch.py <prepared-uhttpd-source-dir> <openwrt-uhttpd-package-dir>
-The pinned upstream revision is 60f64bec40c8113cf09815ec377761b1f4f95f22.
-A missing upstream anchor aborts rather than silently producing an unpatched IPK.
-"""
+"""Apply UCI opt-in trusted X-Real-IP and X-Forwarded-For to pinned uhttpd."""
 from pathlib import Path
 import sys
 
+ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path.cwd()
+PACKAGE = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else ROOT
 
-def replace_once(text, old, new, label):
-    count = text.count(old)
+
+def replace_once(path, old, new):
+    file_path = Path(path)
+    if not file_path.is_absolute():
+        file_path = ROOT / file_path
+    content = file_path.read_text()
+    count = content.count(old)
     if count != 1:
-        raise RuntimeError(f"{label}: expected one anchor, found {count}: {old[:100]!r}")
-    return text.replace(old, new, 1)
+        raise SystemExit(f"{file_path}: expected one patch anchor, found {count}: {old[:100]!r}")
+    file_path.write_text(content.replace(old, new, 1))
 
 
-def patch(source_dir, package_dir):
-    paths = {
-        "main": source_dir / "main.c",
-        "client": source_dir / "client.c",
-        "header": source_dir / "uhttpd.h",
-        "init": package_dir / "files" / "uhttpd.init",
-        "config": package_dir / "files" / "uhttpd.config",
+replace_once("uhttpd.h",
+    "\tstruct list_head sni_redirect;\n};\n\nstruct sni_redirect {",
+    "\tstruct list_head sni_redirect;\n\tstruct list_head real_ip_trusted;\n};\n\nstruct sni_redirect {")
+replace_once("uhttpd.h",
+    "struct sni_redirect {\n\tstruct list_head list;\n\tconst char *host;\n\tconst char *url;\n};",
+    "struct sni_redirect {\n\tstruct list_head list;\n\tconst char *host;\n\tconst char *url;\n};\n\nstruct real_ip_trusted {\n\tstruct list_head list;\n\tstruct uh_addr addr;\n};")
+# Append this field to preserve offsets of existing struct client members
+# consumed by separately-built uhttpd plugins.
+replace_once("uhttpd.h", "\tstruct dispatch dispatch;\n};",
+    "\tstruct dispatch dispatch;\n\tstruct uh_addr remote_addr;\n};")
+
+replace_once("main.c", "#include <sys/socket.h>\n#include <netinet/in.h>",
+    "#include <sys/socket.h>\n#include <arpa/inet.h>\n#include <netinet/in.h>")
+replace_once("main.c", r"Enable RFC1918 filter\n",
+    r"Enable RFC1918 filter\n\t-z address      Trust this reverse proxy for forwarded client IP headers (repeatable)\n")
+replace_once("main.c", "\tINIT_LIST_HEAD(&conf.sni_redirect);\n}",
+    "\tINIT_LIST_HEAD(&conf.sni_redirect);\n\tINIT_LIST_HEAD(&conf.real_ip_trusted);\n}")
+replace_once("main.c", "static void init_defaults_post(void)\n{",
+r"""static void add_real_ip_trusted(const char *value)
+{
+    struct real_ip_trusted *entry;
+
+    entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        perror("calloc");
+        exit(1);
     }
-    result = {key: path.read_text() for key, path in paths.items()}
 
-    main = result["main"]
-    main = replace_once(
-        main, "#include <netinet/in.h>\n",
-        "#include <netinet/in.h>\n#include <arpa/inet.h>\n", "main.c include"
-    )
-    main = replace_once(
-        main, "static int usage(const char *name)\n{",
-        """static void add_realip_trusted(const char *address)
+    if (inet_pton(AF_INET, value, &entry->addr.in) == 1)
+        entry->addr.family = AF_INET;
+    else if (inet_pton(AF_INET6, value, &entry->addr.in6) == 1)
+        entry->addr.family = AF_INET6;
+    else {
+        fprintf(stderr, "uhttpd: invalid trusted proxy address: %s\n", value);
+        free(entry);
+        exit(1);
+    }
+
+    list_add_tail(&entry->list, &conf.real_ip_trusted);
+}
+
+static void init_defaults_post(void)
+{""")
+replace_once("main.c",
+    '"A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qQ:Rr:Ss:T:t:U:u:Xx:y:"',
+    '"A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qQ:Rr:Ss:T:t:U:u:Xx:y:z:"')
+replace_once("main.c", "\t\tcase 'R':\n\t\t\tconf.rfc1918_filter = 1;\n\t\t\tbreak;\n",
+    "\t\tcase 'R':\n\t\t\tconf.rfc1918_filter = 1;\n\t\t\tbreak;\n\n\t\tcase 'z':\n\t\t\tadd_real_ip_trusted(optarg);\n\t\t\tbreak;\n")
+
+replace_once("client.c", " */\n\n#include <libubox/blobmsg.h>",
+    " */\n\n#include <arpa/inet.h>\n#include <ctype.h>\n#include <libubox/blobmsg.h>")
+replace_once("client.c", "static bool rfc1918_filter_check(struct client *cl)\n{",
+r"""/*
+ * Only explicitly trusted TCP peers may supply forwarding headers.
+ * Walk X-Forwarded-For from right to left, skipping trusted proxy hops.
+ * The raw TCP peer is immutable and peer_addr is reset on every request.
+ */
+static bool real_ip_addr_equal(const struct uh_addr *a, const struct uh_addr *b)
 {
-\tstruct realip_trust *proxy = calloc(1, sizeof(*proxy));
+    if (a->family != b->family)
+        return false;
 
-\tif (!proxy)
-\t\treturn;
+    if (a->family == AF_INET)
+        return a->in.s_addr == b->in.s_addr;
 
-\tif (inet_pton(AF_INET, address, &proxy->addr.in) == 1)
-\t\tproxy->addr.family = AF_INET;
-\telse if (inet_pton(AF_INET6, address, &proxy->addr.in6) == 1)
-\t\tproxy->addr.family = AF_INET6;
-\telse {
-\t\tfprintf(stderr, "uhttpd: ignoring invalid trusted proxy IP: %s\\n", address);
-\t\tfree(proxy);
-\t\treturn;
-\t}
+    if (a->family == AF_INET6)
+        return !memcmp(&a->in6, &b->in6, sizeof(struct in6_addr));
 
-\tlist_add_tail(&proxy->list, &conf.realip_trusted);
+    return false;
 }
 
-static int usage(const char *name)
-{""",
-        "main.c trusted proxy parser"
-    )
-    main = replace_once(
-        main,
-        'Enable RFC1918 filter\\n"\n',
-        'Enable RFC1918 filter\\n"\n\t\t"\\t-J ip           Trust X-Real-IP only from this proxy IP (repeatable)\\n"\n',
-        "main.c help"
-    )
-    main = replace_once(
-        main, "INIT_LIST_HEAD(&conf.cgi_alias);",
-        "INIT_LIST_HEAD(&conf.cgi_alias);\n\tINIT_LIST_HEAD(&conf.realip_trusted);",
-        "main.c list initialization"
-    )
-    main = replace_once(
-        main,
-        '"A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qQ:Rr:Ss:T:t:U:u:Xx:y:"',
-        '"A:ab:C:c:Dd:E:e:fh:H:I:i:K:k:L:l:m:N:n:O:o:P:p:qQ:Rr:Ss:T:t:U:u:Xx:y:J:"',
-        "main.c getopt"
-    )
-    main = replace_once(
-        main,
-        "\t\tcase 'R':\n\t\t\tconf.rfc1918_filter = 1;\n\t\t\tbreak;",
-        "\t\tcase 'R':\n\t\t\tconf.rfc1918_filter = 1;\n\t\t\tbreak;\n\n"
-        "\t\tcase 'J':\n\t\t\tadd_realip_trusted(optarg);\n\t\t\tbreak;",
-        "main.c option handling"
-    )
-    result["main"] = main
-
-    header = result["header"]
-    header = replace_once(
-        header, "struct client;\n",
-        """struct client;
-
-struct realip_trust {
-\tstruct list_head list;
-\tstruct uh_addr addr;
-};
-""",
-        "uhttpd.h trust declaration"
-    )
-    header = replace_once(
-        header, "\tstruct list_head cgi_alias;",
-        "\tstruct list_head cgi_alias;\n\tstruct list_head realip_trusted;",
-        "uhttpd.h trust list"
-    )
-    header = replace_once(
-        header, "\tstruct uh_addr srv_addr, peer_addr;",
-        "\tstruct uh_addr srv_addr, peer_addr, socket_peer_addr;",
-        "uhttpd.h socket peer storage"
-    )
-    result["header"] = header
-
-    client = result["client"]
-    client = replace_once(
-        client, "#include <libubox/blobmsg.h>\n",
-        "#include <arpa/inet.h>\n#include <libubox/blobmsg.h>\n",
-        "client.c inet_pton include"
-    )
-    client = replace_once(
-        client,
-        "\t*newline = 0;\n\tblob_buf_init(&cl->hdr, 0);",
-        "\t*newline = 0;\n"
-        "\t/* A keep-alive connection may carry a different client IP each request. */\n"
-        "\tcl->peer_addr = cl->socket_peer_addr;\n"
-        "\tblob_buf_init(&cl->hdr, 0);",
-        "client.c keep-alive reset"
-    )
-    client = replace_once(
-        client,
-        "static void client_header_complete(struct client *cl)\n{",
-        """static void client_apply_realip(struct client *cl)
+static bool real_ip_is_trusted(const struct uh_addr *addr)
 {
-\tstruct realip_trust *proxy;
-\tstruct blob_attr *cur;
-\tstruct uh_addr addr = {0};
-\tconst char *forwarded = NULL;
-\tbool trusted = false;
-\tint rem;
+    struct real_ip_trusted *entry;
 
-\t/* Trust the original TCP peer, never the request header itself. */
-\tlist_for_each_entry(proxy, &conf.realip_trusted, list) {
-\t\tif (proxy->addr.family != cl->socket_peer_addr.family)
-\t\t\tcontinue;
+    list_for_each_entry(entry, &conf.real_ip_trusted, list) {
+        if (real_ip_addr_equal(addr, &entry->addr))
+            return true;
+    }
 
-\t\tif (proxy->addr.family == AF_INET &&
-\t\t    proxy->addr.in.s_addr == cl->socket_peer_addr.in.s_addr)
-\t\t\ttrusted = true;
-\t\telse if (proxy->addr.family == AF_INET6 &&
-\t\t         !memcmp(&proxy->addr.in6, &cl->socket_peer_addr.in6,
-\t\t                 sizeof(proxy->addr.in6)))
-\t\t\ttrusted = true;
-
-\t\tif (trusted)
-\t\t\tbreak;
-\t}
-\tif (!trusted)
-\t\treturn;
-
-\t/* Duplicate or invalid headers must not override the real peer. */
-\tblob_for_each_attr(cur, cl->hdr.head, rem) {
-\t\tif (strcmp(blobmsg_name(cur), "x-real-ip"))
-\t\t\tcontinue;
-\t\tif (forwarded)
-\t\t\treturn;
-\t\tforwarded = blobmsg_get_string(cur);
-\t}
-
-\tif (!forwarded)
-\t\treturn;
-
-\tif (inet_pton(AF_INET, forwarded, &addr.in) == 1)
-\t\taddr.family = AF_INET;
-\telse if (inet_pton(AF_INET6, forwarded, &addr.in6) == 1)
-\t\taddr.family = AF_INET6;
-\telse
-\t\treturn;
-
-\taddr.port = cl->socket_peer_addr.port;
-\tcl->peer_addr = addr;
+    return false;
 }
 
-static void client_header_complete(struct client *cl)
-{""",
-        "client.c trusted header handler"
-    )
-    client = replace_once(
-        client,
-        "\tif (!rfc1918_filter_check(cl))\n\t\treturn;\n",
-        "\tif (!rfc1918_filter_check(cl))\n\t\treturn;\n\n"
-        "\t/* Run rebinding protection against the TCP peer before rewriting it. */\n"
-        "\tclient_apply_realip(cl);\n",
-        "client.c header completion"
-    )
-    client = replace_once(
-        client,
-        "\tset_addr(&cl->peer_addr, &addr);\n",
-        "\tset_addr(&cl->peer_addr, &addr);\n"
-        "\tcl->socket_peer_addr = cl->peer_addr;\n",
-        "client.c original TCP peer"
-    )
-    result["client"] = client
+static bool real_ip_parse(const char *value, struct uh_addr *addr)
+{
+    char buf[INET6_ADDRSTRLEN];
+    const char *start = value;
+    size_t len;
 
-    init = result["init"]
-    init = replace_once(
-        init,
-        "start_instance()\n{",
-        """append_realip_proxy() {
-\t[ -n "$1" ] && procd_append_param command -J "$1"
+    while (*start && isspace((unsigned char)*start))
+        start++;
+
+    len = strlen(start);
+    while (len && isspace((unsigned char)start[len - 1]))
+        len--;
+
+    if (!len || len >= sizeof(buf))
+        return false;
+
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+
+    memset(addr, 0, sizeof(*addr));
+    if (inet_pton(AF_INET, buf, &addr->in) == 1) {
+        addr->family = AF_INET;
+        return true;
+    }
+
+    if (inet_pton(AF_INET6, buf, &addr->in6) == 1) {
+        addr->family = AF_INET6;
+        return true;
+    }
+
+    return false;
 }
 
-start_instance()
-{""",
-        "uhttpd.init proxy list function"
+static bool real_ip_get_header(struct client *cl, const char *name,
+                               const char **value)
+{
+    struct blob_attr *cur;
+    int rem, matches = 0;
+
+    *value = NULL;
+    blob_for_each_attr(cur, cl->hdr.head, rem) {
+        if (strcmp(blobmsg_name(cur), name))
+            continue;
+
+        matches++;
+        *value = blobmsg_get_string(cur);
+    }
+
+    return matches == 1 && *value;
+}
+
+static void client_update_real_ip(struct client *cl)
+{
+    struct uh_addr candidate;
+    const char *value = NULL;
+    char *copy = NULL, *p, *comma;
+    char **parts = NULL;
+    size_t count = 1, i;
+    bool found = false, malformed = false;
+
+    cl->peer_addr = cl->remote_addr;
+
+    if (!real_ip_is_trusted(&cl->remote_addr))
+        return;
+
+    /*
+     * Prefer X-Forwarded-For: it preserves the proxy chain and can identify
+     * the client across multiple trusted reverse proxies. Parse from right
+     * to left and stop at the first non-trusted address.
+     */
+    if (real_ip_get_header(cl, "x-forwarded-for", &value) && *value) {
+        for (p = (char *)value; *p; p++) {
+            if (*p == ',')
+                count++;
+        }
+
+        if (count <= UH_LIMIT_HEADER_COUNT) {
+            copy = strdup(value);
+            parts = calloc(count, sizeof(*parts));
+            if (copy && parts) {
+                p = copy;
+                for (i = 0; i < count; i++) {
+                    parts[i] = p;
+                    comma = strchr(p, ',');
+                    if (comma) {
+                        *comma = '\0';
+                        p = comma + 1;
+                    } else if (i != count - 1) {
+                        malformed = true;
+                        break;
+                    }
+                }
+
+                if (!malformed) {
+                    for (i = count; i > 0; i--) {
+                        if (!real_ip_parse(parts[i - 1], &candidate)) {
+                            malformed = true;
+                            break;
+                        }
+
+                        if (real_ip_is_trusted(&candidate))
+                            continue;
+
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (found && !malformed)
+        cl->peer_addr = candidate;
+
+    free(parts);
+    free(copy);
+
+    if (found && !malformed)
+        return;
+
+    /*
+     * X-Real-IP is the fallback for proxies that provide a single client IP
+     * but do not provide a usable X-Forwarded-For chain.
+     */
+    if (real_ip_get_header(cl, "x-real-ip", &value) &&
+        !strchr(value, ',') && real_ip_parse(value, &candidate))
+        cl->peer_addr = candidate;
+}
+
+static bool rfc1918_filter_check(struct client *cl)
+{""")
+replace_once("client.c",
+    "\tif (!request_header_check(cl))\n\t\treturn;\n\n\tif (!rfc1918_filter_check(cl))",
+    "\tif (!request_header_check(cl))\n\t\treturn;\n\n\tif (!rfc1918_filter_check(cl))")
+replace_once("client.c",
+    "\tif (!rfc1918_filter_check(cl))\n\t\treturn;\n\n\tif (!tls_redirect_check(cl))",
+    "\tif (!rfc1918_filter_check(cl))\n\t\treturn;\n\n\tclient_update_real_ip(cl);\n\n\tif (!tls_redirect_check(cl))")
+replace_once("client.c", "\tset_addr(&cl->peer_addr, &addr);\n\tsl = sizeof(addr);",
+    "\tset_addr(&cl->peer_addr, &addr);\n\tcl->remote_addr = cl->peer_addr;\n\tsl = sizeof(addr);")
+
+def patch_init_script():
+    """Patch files/uhttpd.init idempotently.
+
+    OpenWrt can invoke Build/Prepare more than once during a package build.
+    The package files directory persists between those invocations, so the
+    init-script edits must never append duplicate helpers or command options.
+    """
+    init_file = PACKAGE / "files/uhttpd.init"
+    content = init_file.read_text()
+
+    function_start = "append_real_ip_trusted() {"
+    function_block = (
+        'append_real_ip_trusted() {\n'
+        '\tlocal addr="$1"\n'
+        '\t[ -n "$addr" ] && procd_append_param command -z "$addr"\n'
+        '}\n\n'
     )
-    init = replace_once(
-        init,
-        '\tappend_bool "$cfg" rfc1918_filter "-R" 0\n',
-        '\tappend_bool "$cfg" rfc1918_filter "-R" 0\n\n'
-        '\t# Absent or disabled configuration never passes RealIP arguments.\n'
+
+    # Keep only the first complete definition if an older run left duplicates.
+    lines = content.splitlines(keepends=True)
+    output = []
+    function_seen = False
+    skip_duplicate_function = False
+    for line in lines:
+        if line.strip() == function_start:
+            if function_seen:
+                skip_duplicate_function = True
+                continue
+            function_seen = True
+
+        if skip_duplicate_function:
+            if line.strip() == "}":
+                skip_duplicate_function = False
+            continue
+
+        output.append(line)
+
+    content = "".join(output)
+    if not function_seen:
+        anchor = "append_bool() {\n"
+        count = content.count(anchor)
+        if count != 1:
+            raise SystemExit(
+                f"{init_file}: expected one append_bool anchor, found {count}"
+            )
+        content = content.replace(anchor, function_block + anchor, 1)
+
+    # Likewise, retain only one invocation of the trusted-proxy option helper.
+    call_marker = "config_list_foreach"
+    call_target = "set_real_ip_from"
+    call_helper = "append_real_ip_trusted"
+    call_line = (
         '\tlocal realip_enabled\n'
         '\tconfig_get_bool realip_enabled "$cfg" realip_enabled 0\n'
-        '\t[ "$realip_enabled" = 1 ] && config_list_foreach "$cfg" set_real_ip_from append_realip_proxy\n',
-        "uhttpd.init opt-in"
+        '\t[ "$realip_enabled" = 1 ] && config_list_foreach "$cfg" '
+        'set_real_ip_from append_real_ip_trusted\n'
     )
-    result["init"] = init
+    output = []
+    call_seen = False
+    for line in content.splitlines(keepends=True):
+        if call_marker in line and call_target in line and call_helper in line:
+            if call_seen:
+                continue
+            call_seen = True
+        output.append(line)
 
-    config = result["config"]
-    config = replace_once(
-        config,
-        "\toption rfc1918_filter 1\n",
-        "\toption rfc1918_filter 1\n\n"
-        "\t# Trusted X-Real-IP: disabled by default; do not trust arbitrary clients.\n"
+    content = "".join(output)
+    if not call_seen:
+        anchor = '\tappend_bool "$cfg" rfc1918_filter "-R" 0\n'
+        count = content.count(anchor)
+        if count != 1:
+            raise SystemExit(
+                f"{init_file}: expected one rfc1918_filter anchor, found {count}"
+            )
+        content = content.replace(anchor, anchor + call_line, 1)
+
+    init_file.write_text(content)
+
+
+patch_init_script()
+
+def patch_default_config():
+    conf = PACKAGE / "files/uhttpd.config"
+    value = conf.read_text()
+    marker = "option realip_enabled '0'"
+    if marker in value:
+        return
+    anchor = "\toption rfc1918_filter 1\n"
+    if value.count(anchor) != 1:
+        raise SystemExit(f"{conf}: expected one config anchor")
+    value = value.replace(anchor, anchor + (
+        "\n\t# Trust forwarding headers only when explicitly enabled.\n"
         "\toption realip_enabled '0'\n"
-        "\t# list set_real_ip_from '192.168.0.251'\n",
-        "uhttpd.config disabled default"
-    )
-    result["config"] = config
+        "\t# list set_real_ip_from '192.168.0.251'\n"
+    ), 1)
+    conf.write_text(value)
 
-    # Validate every upstream anchor before changing any source/package file.
-    for key, path in paths.items():
-        path.write_text(result[key])
-        print(f"Patched {path}")
-
-
-def main():
-    if len(sys.argv) != 3:
-        raise SystemExit(__doc__)
-    try:
-        patch(Path(sys.argv[1]), Path(sys.argv[2]))
-    except (OSError, RuntimeError) as error:
-        raise SystemExit(f"RealIP patch FAILED: {error}")
-
-
-if __name__ == "__main__":
-    main()
+patch_default_config()
+print("Applied disabled-by-default X-Real-IP and X-Forwarded-For support.")
