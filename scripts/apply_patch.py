@@ -69,6 +69,12 @@ replace_once("main.c", "\t\tcase 'R':\n\t\t\tconf.rfc1918_filter = 1;\n\t\t\tbre
 
 replace_once("client.c", " */\n\n#include <libubox/blobmsg.h>",
     " */\n\n#include <arpa/inet.h>\n#include <ctype.h>\n#include <libubox/blobmsg.h>")
+# Restore the immutable TCP source at the beginning of *every* keep-alive
+# request, before RFC1918 filtering or any forwarding-header processing.
+replace_once("client.c",
+    "\t*newline = 0;\n\tblob_buf_init(&cl->hdr, 0);",
+    "\t*newline = 0;\n\tcl->peer_addr = cl->remote_addr;\n\tblob_buf_init(&cl->hdr, 0);")
+
 replace_once("client.c", "static bool rfc1918_filter_check(struct client *cl)\n{",
 r"""/*
  * Only explicitly trusted TCP peers may supply forwarding headers.
